@@ -68,6 +68,71 @@ switch_5g_band:
       selector:
         text:
 
+set_cellular_bands:
+  name: Set cellular bands
+  description: Enable cellular band selection and choose LTE and 5G SA bands when the router firmware exposes them.
+  fields:
+    lte_bands:
+      name: LTE bands
+      description: LTE bands to allow.
+      required: false
+      example: ["B3", "B7", "B20"]
+      selector:
+        select:
+          multiple: true
+          options:
+            - "B1"
+            - "B3"
+            - "B5"
+            - "B7"
+            - "B8"
+            - "B20"
+            - "B28"
+            - "B32"
+            - "B38"
+            - "B40"
+            - "B41"
+            - "B42"
+            - "B43"
+    nr5g_bands:
+      name: 5G SA bands
+      description: 5G SA bands to allow.
+      required: false
+      example: ["n28", "n78"]
+      selector:
+        select:
+          multiple: true
+          options:
+            - "n1"
+            - "n3"
+            - "n5"
+            - "n7"
+            - "n8"
+            - "n20"
+            - "n28"
+            - "n38"
+            - "n40"
+            - "n41"
+            - "n71"
+            - "n75"
+            - "n76"
+            - "n77"
+            - "n78"
+    enable_band_select:
+      name: Enable band select
+      description: Turn the router's Band Select switch on or off.
+      required: false
+      default: true
+      selector:
+        boolean:
+    entry_id:
+      name: Config entry ID
+      description: Optional config entry id to target a specific router instance
+      required: false
+      example: "abcd1234"
+      selector:
+        text:
+
 send_at_command:
   name: Send AT command
   description: Send an AT command to the modem via the router's web UI. The result will be logged.

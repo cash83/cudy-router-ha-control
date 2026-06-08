@@ -549,3 +549,25 @@ def test_parse_lan_and_wan_settings_support_suffix_fallback_keys() -> None:
     assert lan["subnet_mask"]["value"] == "255.255.255.0"
     assert wan["protocol"]["value"] == "dhcp"
     assert wan["subnet_mask"]["value"] == "255.255.255.0"
+
+
+def test_parse_cellular_settings_extracts_band_checkboxes() -> None:
+    """P4 cellular pages expose multi-select bands as checkbox groups."""
+    html = """
+    <form>
+      <input type="hidden" name="cbid.network.4g.selband" value="1" />
+      <input type="checkbox" name="cbid.network.4g.nr5g_sabands" value="28" checked />
+      <input type="checkbox" name="cbid.network.4g.nr5g_sabands" value="78" />
+      <input type="checkbox" name="cbid.network.4g.ltebands" value="3" checked />
+      <input type="checkbox" name="cbid.network.4g.ltebands" value="7" />
+    </form>
+    """
+
+    parsed = parser_settings.parse_cellular_settings(html)
+
+    assert parsed["band_select"]["value"] is True
+    assert parsed["nr5g_band_28"]["value"] is True
+    assert parsed["nr5g_band_78"]["value"] is False
+    assert parsed["lte_band_3"]["value"] is True
+    assert parsed["lte_band_7"]["value"] is False
+    assert parsed["lte_band_3"]["attributes"] == {"band": "B3"}

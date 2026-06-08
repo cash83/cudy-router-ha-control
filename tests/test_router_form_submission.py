@@ -95,6 +95,82 @@ def test_submit_form_executes_embedded_apply_workflow(monkeypatch) -> None:
     assert apply_post == {"token": ["apply-token"]}
 
 
+def test_set_cellular_bands_posts_lte_and_5g_checkbox_values(monkeypatch) -> None:
+    """P4 band selection uses repeated checkbox fields for LTE and 5G SA bands."""
+    router = router_module.CudyRouter(None, "https://192.168.10.1", "user", "password")
+    monkeypatch.setattr(router_module.time, "time", lambda: 1_700_000_000)
+    monkeypatch.setattr(router_module.time, "sleep", lambda _: None)
+
+    form_html = """
+    <form action="/cgi-bin/luci/admin/network/gcom/config/apn?embedded=&iface=4g">
+      <input type="hidden" name="token" value="page-token" />
+      <input type="hidden" name="timeclock" value="" />
+      <input type="hidden" name="cbi.submit" value="1" />
+      <input type="hidden" name="cbid.network.4g.selband" value="0" />
+      <input type="checkbox" name="cbid.network.4g.nr5g_sabands" value="28" />
+      <input type="checkbox" name="cbid.network.4g.nr5g_sabands" value="78" />
+      <input type="checkbox" name="cbid.network.4g.ltebands" value="3" />
+      <input type="checkbox" name="cbid.network.4g.ltebands" value="7" />
+      <input type="checkbox" name="cbid.network.4g.ltebands" value="20" />
+      <button type="submit" name="cbi.apply">Save &amp; Apply</button>
+    </form>
+    """
+    posted: list[tuple[str, dict[str, list[str]]]] = []
+
+    def fake_get(path: str, **kwargs):
+        if path == "admin/network/gcom/config/apn?embedded=&iface=4g":
+            return _response(form_html)
+        if path == "admin/servicectl/status":
+            return _response("finish")
+        raise AssertionError(f"Unexpected GET path: {path}")
+
+    def fake_post(path: str, **kwargs):
+        payload = parse_qs(kwargs["data"], keep_blank_values=True)
+        posted.append((path, payload))
+        if path == "admin/network/gcom/config/apn?embedded=&iface=4g":
+            return _response("ok")
+        if path == "admin/servicectl/restart/gcom":
+            return _response("ok")
+        raise AssertionError(f"Unexpected POST path: {path}")
+
+    monkeypatch.setattr(router, "_luci_get", fake_get)
+    monkeypatch.setattr(router, "_luci_post", fake_post)
+
+    result = router.set_cellular_bands(
+        lte_bands=["B3", "B7", "20"],
+        nr5g_bands=["n28", "78"],
+    )
+
+    assert result == (200, "Configuration applied.")
+    form_post = posted[0][1]
+    assert form_post["cbid.network.4g.selband"] == ["1"]
+    assert form_post["cbid.network.4g.ltebands"] == ["3", "7", "20"]
+    assert form_post["cbid.network.4g.nr5g_sabands"] == ["28", "78"]
+    assert posted[1] == ("admin/servicectl/restart/gcom", {"token": ["page-token"]})
+
+
+def test_set_cellular_bands_rejects_unsupported_band(monkeypatch) -> None:
+    """Unknown bands should not be posted to the router form."""
+    router = router_module.CudyRouter(None, "https://192.168.10.1", "user", "password")
+    form_html = """
+    <form action="/cgi-bin/luci/admin/network/gcom/config/apn?embedded=&iface=4g">
+      <input type="hidden" name="cbid.network.4g.selband" value="0" />
+      <input type="checkbox" name="cbid.network.4g.ltebands" value="3" />
+      <input type="checkbox" name="cbid.network.4g.nr5g_sabands" value="78" />
+    </form>
+    """
+
+    monkeypatch.setattr(
+        router,
+        "get",
+        lambda path, silent=False: form_html if path == "admin/network/gcom/config/apn?embedded=&iface=4g" else "",
+    )
+
+    result = router.set_cellular_bands(lte_bands=["B99"], nr5g_bands=["n78"])
+
+    assert result == (0, "Unsupported cellular bands: lte=99 nr5g=-")
+
+
 def test_set_device_access_supports_vpn_toggle(monkeypatch) -> None:
     """Per-device access toggles should support the VPN control exposed by R700."""
     router = router_module.CudyRouter(None, "https://192.168.10.1", "user", "password")

@@ -1224,8 +1224,114 @@ class CudyRouter:
         }
         return self.set_cellular_setting("network_mode", mapping.get(band_value, band_value))
 
+    def set_cellular_bands(
+        self,
+        *,
+        lte_bands: list[str] | None = None,
+        nr5g_bands: list[str] | None = None,
+        enabled: bool = True,
+    ) -> tuple[int, str]:
+        """Set modem LTE/5G band-selection checkboxes when firmware exposes them."""
+        page = "admin/network/gcom/config/apn?embedded=&iface=4g"
+        html = self.get(page, True)
+        if not html:
+            return 0, f"Failed to load page {page}"
+
+        soup = BeautifulSoup(html, "html.parser")
+        available_lte = {
+            str(field.get("value"))
+            for field in soup.find_all("input", attrs={"name": "cbid.network.4g.ltebands"})
+            if field.get("value") not in (None, "")
+        }
+        available_nr5g = {
+            str(field.get("value"))
+            for field in soup.find_all("input", attrs={"name": "cbid.network.4g.nr5g_sabands"})
+            if field.get("value") not in (None, "")
+        }
+
+        if not available_lte and not available_nr5g:
+            return 0, f"Band selection fields not found on {page}"
+
+        normalized_lte = [str(band).upper().removeprefix("B") for band in (lte_bands or [])]
+        normalized_nr5g = [str(band).lower().removeprefix("n") for band in (nr5g_bands or [])]
+
+        invalid_lte = sorted(set(normalized_lte) - available_lte, key=lambda value: int(value))
+        invalid_nr5g = sorted(set(normalized_nr5g) - available_nr5g, key=lambda value: int(value))
+        if invalid_lte or invalid_nr5g:
+            return (
+                0,
+                "Unsupported cellular bands: "
+                f"lte={','.join(invalid_lte) or '-'} nr5g={','.join(invalid_nr5g) or '-'}",
+            )
+
+        overrides: dict[str, Any] = {
+            "cbid.network.4g.selband": "1" if enabled else "0",
+        }
+        if enabled:
+            if normalized_lte:
+                overrides["cbid.network.4g.ltebands"] = normalized_lte
+            if normalized_nr5g:
+                overrides["cbid.network.4g.nr5g_sabands"] = normalized_nr5g
+
+        return self._submit_form(
+            page,
+            overrides,
+            referer=f"{self.base_url}/cgi-bin/luci/admin/network/gcom?iface=4g",
+            apply_services="gcom",
+        )
+
+    def set_cellular_band(self, key: str, enabled: bool) -> tuple[int, str]:
+        """Toggle a single LTE/5G band while preserving the other selected bands."""
+        page = "admin/network/gcom/config/apn?embedded=&iface=4g"
+        html = self.get(page, True)
+        if not html:
+            return 0, f"Failed to load page {page}"
+
+        soup = BeautifulSoup(html, "html.parser")
+
+        def checked_values(field_name: str) -> list[str]:
+            return [
+                str(field.get("value"))
+                for field in soup.find_all("input", attrs={"name": field_name})
+                if field.get("value") not in (None, "") and field.has_attr("checked")
+            ]
+
+        lte_bands = checked_values("cbid.network.4g.ltebands")
+        nr5g_bands = checked_values("cbid.network.4g.nr5g_sabands")
+
+        if key == "band_select":
+            return self.set_cellular_bands(
+                lte_bands=lte_bands,
+                nr5g_bands=nr5g_bands,
+                enabled=enabled,
+            )
+
+        if key.startswith("lte_band_"):
+            band = key.removeprefix("lte_band_")
+            selected = lte_bands
+        elif key.startswith("nr5g_band_"):
+            band = key.removeprefix("nr5g_band_")
+            selected = nr5g_bands
+        else:
+            return 0, f"Unsupported cellular band setting: {key}"
+
+        if enabled and band not in selected:
+            selected.append(band)
+        if not enabled and band in selected:
+            selected.remove(band)
+
+        band_select_enabled = bool(lte_bands or nr5g_bands)
+        return self.set_cellular_bands(
+            lte_bands=lte_bands,
+            nr5g_bands=nr5g_bands,
+            enabled=band_select_enabled,
+        )
+
     def set_cellular_setting(self, key: str, value: str | bool) -> tuple[int, str]:
         """Set a cellular/APN configuration value."""
+        if key == "band_select" or key.startswith(("lte_band_", "nr5g_band_")):
+            return self.set_cellular_band(key, bool(value))
+
         field_map: dict[str, tuple[str, Any]] = {
             "enabled": ("cbid.network.4g.disabled", lambda enabled: "0" if enabled else "1"),
             "data_roaming": ("cbid.network.4g.roaming", lambda enabled: "1" if enabled else "0"),

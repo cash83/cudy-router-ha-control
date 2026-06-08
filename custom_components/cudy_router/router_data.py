@@ -469,6 +469,20 @@ async def collect_router_data(
         )
         if cellular_settings_html:
             cellular_settings = parse_cellular_settings(cellular_settings_html)
+            if not any(
+                key.startswith(("lte_band_", "nr5g_band_"))
+                for key in cellular_settings
+            ):
+                cellular_band_settings_html = await hass.async_add_executor_job(
+                    router.get,
+                    "admin/network/gcom/config/apn?embedded=&iface=4g",
+                    True,
+                )
+                if cellular_band_settings_html:
+                    _merge_module_entries(
+                        cellular_settings,
+                        parse_cellular_settings(cellular_band_settings_html),
+                    )
             if cellular_settings:
                 data[MODULE_CELLULAR_SETTINGS] = cellular_settings
 

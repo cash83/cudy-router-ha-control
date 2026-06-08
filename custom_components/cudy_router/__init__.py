@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from functools import partial
 from typing import Any, Final
 
 import voluptuous as vol
@@ -71,12 +72,16 @@ PLATFORMS: Final[list[Platform]] = [
 SERVICE_REBOOT: Final = "reboot_router"
 SERVICE_RESTART_5G: Final = "restart_5g_connection"
 SERVICE_SWITCH_BAND: Final = "switch_5g_band"
+SERVICE_SET_CELLULAR_BANDS: Final = "set_cellular_bands"
 SERVICE_SEND_SMS: Final = "send_sms"
 SERVICE_SEND_AT_COMMAND: Final = "send_at_command"
 SERVICE_GENERATE_DEBUG_REPORT: Final = "generate_debug_report"
 
 ATTR_ENTRY_ID: Final = "entry_id"
 ATTR_BAND: Final = "band"
+ATTR_ENABLE_BAND_SELECT: Final = "enable_band_select"
+ATTR_LTE_BANDS: Final = "lte_bands"
+ATTR_NR5G_BANDS: Final = "nr5g_bands"
 ATTR_PHONE_NUMBER: Final = "phone_number"
 ATTR_MESSAGE: Final = "message"
 ATTR_COMMAND: Final = "command"
@@ -100,6 +105,15 @@ SERVICE_SWITCH_BAND_SCHEMA: Final = vol.Schema(
     {
         vol.Optional(ATTR_ENTRY_ID): cv.string,
         vol.Required(ATTR_BAND): cv.string,
+    }
+)
+
+SERVICE_SET_CELLULAR_BANDS_SCHEMA: Final = vol.Schema(
+    {
+        vol.Optional(ATTR_ENTRY_ID): cv.string,
+        vol.Optional(ATTR_ENABLE_BAND_SELECT, default=True): cv.boolean,
+        vol.Optional(ATTR_LTE_BANDS, default=[]): vol.All(cv.ensure_list, [cv.string]),
+        vol.Optional(ATTR_NR5G_BANDS, default=[]): vol.All(cv.ensure_list, [cv.string]),
     }
 )
 
@@ -327,6 +341,21 @@ async def _async_setup_services(hass: HomeAssistant) -> None:
         band = call.data[ATTR_BAND]
         await hass.async_add_executor_job(coordinator.api.switch_5g_band, band)
 
+    async def handle_set_cellular_bands(call: ServiceCall) -> None:
+        """Handle the cellular band-selection service call."""
+        coordinator = _get_coordinator(hass, call.data.get(ATTR_ENTRY_ID))
+        if not coordinator:
+            _LOGGER.error("No Cudy Router coordinator found")
+            return
+        await hass.async_add_executor_job(
+            partial(
+                coordinator.api.set_cellular_bands,
+                lte_bands=call.data[ATTR_LTE_BANDS],
+                nr5g_bands=call.data[ATTR_NR5G_BANDS],
+                enabled=call.data[ATTR_ENABLE_BAND_SELECT],
+            )
+        )
+
     async def handle_send_sms(call: ServiceCall) -> None:
         """Handle the send SMS service call."""
         coordinator = _get_coordinator(hass, call.data.get(ATTR_ENTRY_ID))
@@ -399,6 +428,12 @@ async def _async_setup_services(hass: HomeAssistant) -> None:
         SERVICE_SWITCH_BAND,
         handle_switch_band,
         SERVICE_SWITCH_BAND_SCHEMA,
+    )
+
+    _register_service_once(
+        SERVICE_SET_CELLULAR_BANDS,
+        handle_set_cellular_bands,
+        SERVICE_SET_CELLULAR_BANDS_SCHEMA,
     )
 
     _register_service_once(

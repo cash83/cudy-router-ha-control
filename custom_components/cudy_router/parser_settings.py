@@ -194,6 +194,25 @@ def parse_cellular_settings(input_html: str) -> dict[str, Any]:
     if data_roaming is not None:
         data["data_roaming"] = {"value": data_roaming}
 
+    band_select = _hidden_bool(soup, "cbid.network.4g.selband")
+    if band_select is not None:
+        data["band_select"] = {"value": band_select}
+
+    for field_name, key_prefix, label_prefix in (
+        ("cbid.network.4g.ltebands", "lte_band", "B"),
+        ("cbid.network.4g.nr5g_sabands", "nr5g_band", "n"),
+    ):
+        for checkbox in soup.find_all("input", attrs={"name": field_name}):
+            value = checkbox.get("value")
+            if value in (None, ""):
+                continue
+            normalized_value = str(value)
+            key = f"{key_prefix}_{normalized_value}"
+            data[key] = {
+                "value": checkbox.has_attr("checked"),
+                "attributes": {"band": f"{label_prefix}{normalized_value}"},
+            }
+
     for key, field_name, transform in (
         ("sim_slot", "cbid.network.4g.simslot", _normalize_label),
         ("network_mode", "cbid.network.4g.service", None),

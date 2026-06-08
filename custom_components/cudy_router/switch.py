@@ -78,6 +78,13 @@ ROUTER_SETTING_SWITCHES: tuple[CudyRouterSettingSwitchDescription, ...] = (
         entity_category=EntityCategory.CONFIG,
     ),
     CudyRouterSettingSwitchDescription(
+        key="band_select",
+        module=MODULE_CELLULAR_SETTINGS,
+        name_suffix="Band Select",
+        icon="mdi:signal-5g",
+        entity_category=EntityCategory.CONFIG,
+    ),
+    CudyRouterSettingSwitchDescription(
         key="smart_connect",
         module=MODULE_WIRELESS_SETTINGS,
         name_suffix="Smart Connect",
