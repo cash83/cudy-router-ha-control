@@ -1,0 +1,180 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect to Cudy Router",
+        "description": "Enter the connection details for your Cudy router.",
+        "data": {
+          "host": "Router IP address",
+          "username": "[%key:common::config_flow::data::username%]",
+          "password": "[%key:common::config_flow::data::password%]"
+        },
+        "data_description": {
+          "host": "The IP address of your router (e.g., 192.168.10.1)",
+          "username": "Admin username for the router",
+          "password": "Admin password for the router"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Reconnect to Cudy Router",
+        "description": "Update the saved credentials for this router.",
+        "data": {
+          "username": "[%key:common::config_flow::data::username%]",
+          "password": "[%key:common::config_flow::data::password%]"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "[%key:common::config_flow::error::cannot_connect%]",
+      "invalid_auth": "[%key:common::config_flow::error::invalid_auth%]",
+      "unknown": "[%key:common::config_flow::error::unknown%]"
+    },
+    "abort": {
+      "already_configured": "[%key:common::config_flow::abort::already_configured_device%]",
+      "reauth_successful": "Reauthentication was successful."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Configure Cudy Router",
+        "data": {
+          "auto_add_connected_devices": "Automatically add connected devices",
+          "auto_add_device_trackers": "Automatically add device trackers for connected devices",
+          "show_sms_panel_in_sidebar": "Show Cudy SMS in sidebar",
+          "scan_interval": "Update interval"
+        },
+        "data_description": {
+          "auto_add_connected_devices": "Create client devices and live client entities for every currently connected device. Disabled by default for new integrations. Turn this on to automatically create client devices and live per-client entities, or leave it off to only create them for devices listed below.",
+          "auto_add_device_trackers": "Create device_tracker entities for every currently connected device with a MAC address. Disabled by default. Turn this on if you want presence-style trackers in addition to the live client entities.",
+          "show_sms_panel_in_sidebar": "Show the Cudy SMS panel link in the Home Assistant sidebar. Disable this to keep the SMS page available only by direct URL.",
+          "scan_interval": "How often to poll the router for updates (in seconds)"
+        }
+      },
+      "manual_devices": {
+        "title": "Select manual connected devices",
+        "data": {
+          "device_list": "Manually add connected devices"
+        },
+        "data_description": {
+          "device_list": "Select connected clients from a list when automatic connected-device discovery is turned off. Selected manual devices stay in Home Assistant when offline and become unavailable until the client reconnects. Legacy text-based values are still honored until you save this picker."
+        }
+      },
+      "trackers": {
+        "title": "Select tracked devices",
+        "data": {
+          "tracked_device_macs": "Tracked devices"
+        },
+        "data_description": {
+          "tracked_device_macs": "Select specific connected clients that should always keep a device_tracker entity. When automatic connected-device discovery is off, this picker shows the manual connected devices selected on the previous step, or all live connected clients when no manual connected devices are selected. Selected trackers stay available across reloads and show away/not_home when the client is offline."
+        }
+      }
+    }
+  },
+  "services": {
+    "reboot_router": {
+      "name": "Reboot router",
+      "description": "Reboots the Cudy router.",
+      "fields": {
+        "entry_id": {
+          "name": "Config entry ID",
+          "description": "The config entry ID of the router (optional if only one router is configured)."
+        }
+      }
+    },
+    "restart_5g_connection": {
+      "name": "Restart 5G connection",
+      "description": "Restarts the 5G/LTE modem connection.",
+      "fields": {
+        "entry_id": {
+          "name": "Config entry ID",
+          "description": "The config entry ID of the router (optional if only one router is configured)."
+        }
+      }
+    },
+    "switch_5g_band": {
+      "name": "Switch 5G band",
+      "description": "Switches the 5G modem band preference.",
+      "fields": {
+        "entry_id": {
+          "name": "Config entry ID",
+          "description": "The config entry ID of the router (optional if only one router is configured)."
+        },
+        "band": {
+          "name": "Band",
+          "description": "The band value to switch to (e.g., 'auto', '5g-only', 'lte-only')."
+        }
+      }
+    },
+    "send_sms": {
+      "name": "Send SMS",
+      "description": "Sends an SMS message via the router's cellular modem.",
+      "fields": {
+        "entry_id": {
+          "name": "Config entry ID",
+          "description": "The config entry ID of the router (optional if only one router is configured)."
+        },
+        "phone_number": {
+          "name": "Phone number",
+          "description": "The destination phone number with country code (e.g., +441234567890)."
+        },
+        "message": {
+          "name": "Message",
+          "description": "The SMS text content."
+        }
+      }
+    },
+    "send_at_command": {
+      "name": "Send AT command",
+      "description": "Sends an AT command directly to the modem (advanced users).",
+      "fields": {
+        "entry_id": {
+          "name": "Config entry ID",
+          "description": "The config entry ID of the router (optional if only one router is configured)."
+        },
+        "command": {
+          "name": "Command",
+          "description": "The AT command to execute (e.g., 'AT+CSQ')."
+        }
+      }
+    }
+  },
+  "entity": {
+    "sensor": {
+      "mesh_count": {
+        "name": "Mesh devices"
+      },
+      "mesh_name": {
+        "name": "Name"
+      },
+      "mesh_model": {
+        "name": "Model"
+      },
+      "mesh_mac_address": {
+        "name": "MAC address"
+      },
+      "mesh_firmware_version": {
+        "name": "Firmware"
+      },
+      "mesh_status": {
+        "name": "Status"
+      },
+      "mesh_ip_address": {
+        "name": "IP address"
+      }
+    },
+    "switch": {
+      "mesh_led": {
+        "name": "LED"
+      }
+    },
+    "button": {
+      "reboot": {
+        "name": "Reboot"
+      },
+      "mesh_reboot": {
+        "name": "Reboot"
+      }
+    }
+  }
+}

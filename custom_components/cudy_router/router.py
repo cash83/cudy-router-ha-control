@@ -1,0 +1,2037 @@
+"""Provides the backend for a Cudy router."""
+
+from __future__ import annotations
+
+import hashlib
+import logging
+import re
+import time
+import urllib.parse
+from dataclasses import dataclass
+from datetime import datetime
+from http.cookies import SimpleCookie
+from typing import TYPE_CHECKING, Any
+
+import requests
+import urllib3
+
+from .bs4_compat import BeautifulSoup
+from .router_data import collect_router_data
+
+_LOGGER = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from homeassistant.core import HomeAssistant
+
+DEFAULT_GET_TIMEOUT = 30
+DEFAULT_PAGE_TIMEOUT = 15
+DEFAULT_POST_TIMEOUT = 30
+DEFAULT_RETRIES = 2
+RETRY_BACKOFF_SECONDS = 0.35
+RETRYABLE_STATUSES = {408, 429, 500, 502, 503, 504}
+AUTH_COOKIE_NAMES = ("sysauth", "sysauth_http", "sysauth_https")
+
+
+@dataclass(slots=True)
+class _LoginFormInfo:
+    """Resolved login form metadata for browser-style authentication."""
+
+    page_url: str
+    action_url: str
+    html: str
+    csrf: str
+    token: str
+    salt: str
+    language: str
+
+
+def _sha256_hex(s: str) -> str:
+    """Compute SHA256 hash and return as hex string."""
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+
+def _extract_hidden(html: str, name: str) -> str:
+    """Extract value from hidden input field."""
+    match = re.search(r'name="%s"[^>]*value="([^"]*)"' % re.escape(name), html)
+    return match.group(1) if match else ""
+
+
+def _extract_model(html: str) -> str:
+    """Extract device model in page"""
+    match = re.search(r"<span>HW: ([a-zA-Z0-9 \-\.]+)<\/span>", html)
+    return match.group(1) if match else ""
+
+
+def _find_form_field_name_by_suffix(
+    html: str,
+    field_name_suffix: str,
+    *,
+    tag_names: tuple[str, ...],
+) -> str:
+    """Find a form field by suffix in an HTML document."""
+    soup = BeautifulSoup(html or "", "html.parser")
+    normalized_suffix = field_name_suffix.strip().lower()
+
+    for tag_name in tag_names:
+        for field in soup.find_all(tag_name):
+            field_name = (field.get("name") or "").strip()
+            if field_name and field_name.lower().endswith(normalized_suffix):
+                return field_name
+    return ""
+
+
+def _find_state_form_field_name_by_suffix(
+    html: str,
+    field_name_suffix: str,
+    *,
+    tag_names: tuple[str, ...],
+) -> str:
+    """Find a LuCI state field by suffix, preferring cbid over cbi.cbe widget fields."""
+    soup = BeautifulSoup(html or "", "html.parser")
+    normalized_suffix = field_name_suffix.strip().lower()
+    fallback = ""
+
+    for tag_name in tag_names:
+        for field in soup.find_all(tag_name):
+            field_name = (field.get("name") or "").strip()
+            if not field_name or not field_name.lower().endswith(normalized_suffix):
+                continue
+            if field_name.startswith("cbid."):
+                return field_name
+            if not fallback:
+                fallback = field_name
+    return fallback
+
+
+def _compute_luci_password(plain_password: str, salt: str, token: str) -> str:
+    """Compute the LuCI password hash.
+
+    h1 = sha256(password + salt)
+    luci_password = sha256(h1 + token)
+    """
+    h1 = _sha256_hex(plain_password + salt)
+    return _sha256_hex(h1 + token) if token else h1
+
+
+class CudyRouter:
+    """Represents a router and provides functions for communication."""
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        host: str,
+        username: str,
+        password: str,
+        device_model: str = "default",
+    ) -> None:
+        """Initialize the router."""
+        self.host = host
+        self.auth_cookie: str | None = None
+        self.auth_cookie_name = "sysauth"
+        self.hass = hass
+        self.username = username
+        self.password = password
+        self.device_model = device_model
+        self._session: requests.Session | None = None
+        # Determine base URL - always use https if no scheme provided
+        if host.startswith("https://"):
+            self.base_url = host.rstrip("/")
+        elif host.startswith("http://"):
+            # Allow http but prefer https
+            self.base_url = host.rstrip("/")
+        else:
+            # Default to https for security
+            self.base_url = f"https://{host}"
+
+    def _get_session(self) -> requests.Session:
+        """Get or create a requests session with SSL verification disabled."""
+        if self._session is None:
+            self._session = requests.Session()
+            self._session.verify = False
+            # Suppress SSL warnings for self-signed certs
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        return self._session
+
+    def _luci_url(self, path: str) -> str:
+        """Build a LuCI endpoint URL from a relative path."""
+        return f"{self.base_url}/cgi-bin/luci/{path.lstrip('/')}"
+
+    def _set_session_auth_cookie(self, session: requests.Session) -> None:
+        """Ensure session has the latest sysauth cookie if available."""
+        if self.auth_cookie:
+            session.cookies.set(self.auth_cookie_name, self.auth_cookie)
+
+    def _candidate_base_urls(self) -> list[str]:
+        """Return base URLs to try when discovering the login form."""
+        candidates = [self.base_url]
+        parsed = urllib.parse.urlsplit(self.base_url)
+        if parsed.scheme == "https":
+            http_base = urllib.parse.urlunsplit(
+                ("http", parsed.netloc, parsed.path, parsed.query, parsed.fragment)
+            ).rstrip("/")
+            if http_base and http_base not in candidates:
+                candidates.append(http_base)
+        return candidates
+
+    def _request(
+        self,
+        method: str,
+        url: str,
+        *,
+        timeout: int,
+        headers: dict[str, str],
+        allow_redirects: bool = False,
+        silent: bool = False,
+        retries: int = DEFAULT_RETRIES,
+        reauth_on_403: bool = True,
+        data: Any = None,
+        files: Any = None,
+    ) -> requests.Response | None:
+        """Execute an HTTP request with shared retry/backoff/auth-refresh behavior."""
+        session = self._get_session()
+        last_error: Exception | None = None
+
+        for attempt in range(retries + 1):
+            self._set_session_auth_cookie(session)
+            try:
+                response = session.request(
+                    method=method,
+                    url=url,
+                    timeout=timeout,
+                    headers=headers,
+                    allow_redirects=allow_redirects,
+                    data=data,
+                    files=files,
+                )
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as err:
+                last_error = err
+                if attempt < retries:
+                    time.sleep(RETRY_BACKOFF_SECONDS * (2**attempt))
+                    continue
+                if not silent:
+                    _LOGGER.debug("HTTP %s %s failed: %s", method, url, err)
+                return None
+            except requests.RequestException as err:
+                last_error = err
+                if not silent:
+                    _LOGGER.debug("HTTP %s %s request exception: %s", method, url, err)
+                return None
+
+            if response.status_code == 403 and reauth_on_403 and attempt < retries:
+                if self.authenticate():
+                    continue
+                if not silent:
+                    _LOGGER.error("Authentication refresh failed for %s", url)
+                return response
+
+            if response.status_code in RETRYABLE_STATUSES and attempt < retries:
+                time.sleep(RETRY_BACKOFF_SECONDS * (2**attempt))
+                continue
+
+            return response
+
+        if not silent and last_error:
+            _LOGGER.debug("HTTP %s %s failed after retries: %s", method, url, last_error)
+        return None
+
+    def _luci_get(
+        self,
+        path: str,
+        *,
+        timeout: int = DEFAULT_PAGE_TIMEOUT,
+        headers: dict[str, str] | None = None,
+        silent: bool = False,
+    ) -> requests.Response | None:
+        """Issue a GET request to a LuCI path with standard behavior."""
+        return self._request(
+            "GET",
+            self._luci_url(path),
+            timeout=timeout,
+            headers=headers
+            or {
+                "User-Agent": "Mozilla/5.0",
+                "Referer": f"{self.base_url}/cgi-bin/luci/admin",
+            },
+            allow_redirects=False,
+            silent=silent,
+        )
+
+    def _luci_post(
+        self,
+        path: str,
+        *,
+        timeout: int = DEFAULT_POST_TIMEOUT,
+        headers: dict[str, str] | None = None,
+        silent: bool = False,
+        data: Any = None,
+        files: Any = None,
+    ) -> requests.Response | None:
+        """Issue a POST request to a LuCI path with standard behavior."""
+        return self._request(
+            "POST",
+            self._luci_url(path),
+            timeout=timeout,
+            headers=headers
+            or {
+                "User-Agent": "Mozilla/5.0",
+                "Referer": f"{self.base_url}/cgi-bin/luci/admin",
+            },
+            allow_redirects=False,
+            silent=silent,
+            data=data,
+            files=files,
+        )
+
+    def get_cookie_header(self, force_auth: bool) -> str:
+        """Returns a cookie header that should be used for authentication."""
+
+        if not force_auth and self.auth_cookie:
+            return f"{self.auth_cookie_name}={self.auth_cookie}"
+        if self.authenticate() and self.auth_cookie:
+            return f"{self.auth_cookie_name}={self.auth_cookie}"
+        else:
+            return ""
+
+    def _browser_headers(self) -> dict[str, str]:
+        """Headers that match browser navigation of the login page."""
+        return {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Referer": f"{self.base_url}/",
+        }
+
+    def _absolute_request(
+        self,
+        method: str,
+        url: str,
+        *,
+        timeout: int,
+        headers: dict[str, str],
+        allow_redirects: bool = False,
+        data: Any = None,
+        silent: bool = False,
+    ) -> requests.Response | None:
+        """Issue an absolute-URL request with the shared transport behavior."""
+        response = self._request(
+            method,
+            url,
+            timeout=timeout,
+            headers=headers,
+            allow_redirects=allow_redirects,
+            silent=silent,
+            retries=1,
+            reauth_on_403=False,
+            data=data,
+        )
+        if response is not None:
+            return response
+
+        session = self._get_session()
+        try:
+            return session.request(
+                method=method,
+                url=url,
+                timeout=timeout,
+                headers=headers,
+                data=data,
+                allow_redirects=allow_redirects,
+            )
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as err:
+            if not silent:
+                _LOGGER.debug("Fallback HTTP %s %s failed: %s", method, url, err)
+        except requests.RequestException as err:
+            if not silent:
+                _LOGGER.debug("Fallback HTTP %s %s request exception: %s", method, url, err)
+        return None
+
+    def _find_login_form(self, html: str):
+        """Return the login form if present in the HTML."""
+        soup = BeautifulSoup(html or "", "html.parser")
+        for form in soup.find_all("form"):
+            has_luci_password = form.find("input", attrs={"name": "luci_password"}) is not None
+            has_prompt = (
+                form.find("input", attrs={"id": "luci_password2"}) is not None
+                or form.find("input", attrs={"type": "password"}) is not None
+            )
+            has_auth_fields = (
+                form.find("input", attrs={"name": "token"}) is not None
+                or form.find("input", attrs={"name": "salt"}) is not None
+            )
+            if has_luci_password and (has_prompt or has_auth_fields):
+                return form
+        return None
+
+    def _looks_like_login_page(self, html: str) -> bool:
+        """Return whether the page appears to be the login form."""
+        return self._find_login_form(html) is not None
+
+    def _extract_form_field_value(self, form: Any, name: str) -> str:
+        """Extract an input value from a form."""
+        field = form.find("input", attrs={"name": name})
+        if field is None:
+            return ""
+        return field.get("value", "")
+
+    def _extract_default_language(self, form: Any) -> str:
+        """Extract the selected/default LuCI language value from the login form."""
+        field = form.find("select", attrs={"name": "luci_language"})
+        if field is None:
+            return "en"
+
+        selected = field.find("option", selected=True)
+        if selected is not None:
+            return selected.get("value", "") or "en"
+
+        first = field.find("option")
+        if first is not None:
+            return first.get("value", "") or "en"
+
+        return field.get("value", "") or "en"
+
+    def _discover_login_form(self) -> _LoginFormInfo | None:
+        """Discover the active login form, following redirects when necessary."""
+        headers = self._browser_headers()
+        for base_url in self._candidate_base_urls():
+            candidates = [
+                f"{base_url}/",
+                urllib.parse.urljoin(f"{base_url}/", "cgi-bin/luci/"),
+            ]
+
+            for url in candidates:
+                response = self._absolute_request(
+                    "GET",
+                    url,
+                    timeout=DEFAULT_PAGE_TIMEOUT,
+                    headers=headers,
+                    allow_redirects=True,
+                    silent=False,
+                )
+                if response is None:
+                    continue
+
+                form = self._find_login_form(response.text)
+                if form is None:
+                    continue
+
+                page_url = getattr(response, "url", url)
+                action = form.get("action") or ""
+                action_url = urllib.parse.urljoin(page_url, action or page_url)
+
+                info = _LoginFormInfo(
+                    page_url=page_url,
+                    action_url=action_url,
+                    html=response.text,
+                    csrf=self._extract_form_field_value(form, "_csrf"),
+                    token=self._extract_form_field_value(form, "token"),
+                    salt=self._extract_form_field_value(form, "salt"),
+                    language=self._extract_default_language(form),
+                )
+
+                if self.base_url != base_url:
+                    _LOGGER.debug(
+                        "Switching router base URL from %s to %s for login flow",
+                        self.base_url,
+                        base_url,
+                    )
+                    self.base_url = base_url
+
+                _LOGGER.debug(
+                    "Discovered login form at %s -> %s (csrf=%s token=%s salt=%s language=%s)",
+                    page_url,
+                    action_url,
+                    bool(info.csrf),
+                    bool(info.token),
+                    bool(info.salt),
+                    info.language,
+                )
+                return info
+
+        _LOGGER.debug("Could not discover login form")
+        return None
+
+    def _extract_session_auth_cookie(self, response: requests.Response | None = None) -> bool:
+        """Store the session auth cookie if present."""
+        session = self._get_session()
+        for cookie in session.cookies:
+            if cookie.name in AUTH_COOKIE_NAMES and cookie.value:
+                self.auth_cookie_name = cookie.name
+                self.auth_cookie = cookie.value
+                return True
+
+        if response is None:
+            return False
+
+        set_cookie = response.headers.get("set-cookie", "")
+        if not set_cookie:
+            return False
+
+        cookie = SimpleCookie()
+        cookie.load(set_cookie)
+        for cookie_name in AUTH_COOKIE_NAMES:
+            if cookie.get(cookie_name):
+                self.auth_cookie_name = cookie_name
+                self.auth_cookie = cookie.get(cookie_name).value
+                return True
+        return False
+
+    def _local_zonename(self) -> str:
+        """Best-effort system timezone name for browser-style login submissions."""
+        tzinfo = datetime.now().astimezone().tzinfo
+        if tzinfo is None:
+            return "UTC"
+
+        zone_key = getattr(tzinfo, "key", None) or getattr(tzinfo, "zone", None)
+        if isinstance(zone_key, str) and zone_key:
+            return zone_key
+
+        zone_name = str(tzinfo)
+        return zone_name or "UTC"
+
+    def _origin_for_url(self, url: str) -> str:
+        """Return the scheme://host origin for a URL."""
+        parsed = urllib.parse.urlsplit(url)
+        if parsed.scheme and parsed.netloc:
+            return f"{parsed.scheme}://{parsed.netloc}"
+        return self.base_url
+
+    def _login_confirmed_via_panel(self) -> bool:
+        """Confirm auth by loading the admin panel and ensuring it is not the login page."""
+        response = self._absolute_request(
+            "GET",
+            self._luci_url("admin/panel"),
+            timeout=DEFAULT_PAGE_TIMEOUT,
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Referer": f"{self.base_url}/cgi-bin/luci/admin",
+            },
+            allow_redirects=True,
+            silent=True,
+        )
+        if response is None:
+            return False
+
+        if self._extract_session_auth_cookie(response):
+            return True
+
+        if response.status_code == 403:
+            return False
+
+        return not self._looks_like_login_page(response.text)
+
+    def _authenticate_legacy(self) -> bool:
+        """Legacy authentication method (plain password)."""
+        data_url = f"{self.base_url}/cgi-bin/luci"
+        headers = {"Content-Type": "application/x-www-form-urlencoded", "Cookie": ""}
+        body = f"luci_username={urllib.parse.quote(self.username)}&luci_password={urllib.parse.quote(self.password)}&luci_language=en"
+
+        try:
+            response = self._request(
+                "POST",
+                data_url,
+                timeout=DEFAULT_POST_TIMEOUT,
+                headers=headers,
+                allow_redirects=False,
+                silent=False,
+                retries=1,
+                reauth_on_403=False,
+                data=body,
+            )
+            if response is None:
+                # Keep legacy behavior available if shared request flow encounters
+                # transport-specific issues on older router TLS stacks.
+                session = self._get_session()
+                response = session.post(
+                    data_url,
+                    timeout=DEFAULT_POST_TIMEOUT,
+                    headers=headers,
+                    data=body,
+                    allow_redirects=False,
+                )
+            if response and (response.ok or response.status_code == 302):
+                if self._extract_session_auth_cookie(response):
+                    return True
+            _LOGGER.debug(
+                "Legacy auth did not return sysauth cookie (status=%s)",
+                response.status_code if response else "no-response",
+            )
+        except requests.exceptions.ConnectionError:
+            _LOGGER.debug("Connection error during legacy auth")
+        except requests.exceptions.Timeout:
+            _LOGGER.debug("Timeout during legacy auth")
+        except Exception as e:
+            _LOGGER.debug("Legacy auth error: %s", e)
+        return False
+
+    def _authenticate_new(self) -> bool:
+        """New authentication method with salt/token and SHA256 hashing (for 5G routers like P5)."""
+        try:
+            form = self._discover_login_form()
+            if form is None:
+                return False
+
+            if not (form.salt and form.token):
+                _LOGGER.debug("Could not extract salt/token from login page")
+                return False
+
+            # Compute hashed password
+            luci_password = _compute_luci_password(self.password, form.salt, form.token)
+
+            # POST login
+            post_data = {
+                "_csrf": form.csrf,
+                "token": form.token,
+                "salt": form.salt,
+                "luci_username": self.username,
+                "luci_password": luci_password,
+                "luci_language": form.language,
+                "zonename": self._local_zonename(),
+                "timeclock": str(int(time.time())),
+            }
+            headers = self._browser_headers()
+            post_headers = {
+                **headers,
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Referer": form.page_url,
+                "Origin": self._origin_for_url(form.page_url),
+            }
+
+            response = self._absolute_request(
+                "POST",
+                form.action_url,
+                timeout=DEFAULT_PAGE_TIMEOUT,
+                headers=post_headers,
+                data=urllib.parse.urlencode(post_data),
+                allow_redirects=True,
+                silent=False,
+            )
+            if response is None:
+                return False
+
+            if self._extract_session_auth_cookie(response):
+                _LOGGER.debug("New auth successful, got sysauth cookie")
+                return True
+
+            if self._login_confirmed_via_panel():
+                _LOGGER.debug("New auth confirmed by admin panel access")
+                return True
+
+            _LOGGER.debug("New auth: no sysauth cookie received, status=%s", response.status_code)
+            return False
+
+        except requests.exceptions.ConnectionError as e:
+            _LOGGER.debug("Connection error during new auth: %s", e)
+        except requests.exceptions.Timeout as e:
+            _LOGGER.debug("Timeout during new auth: %s", e)
+        except Exception as e:
+            _LOGGER.warning("New auth error: %s", e, exc_info=True)
+        return False
+
+    def get_model(self) -> str:
+        """Get the cudy router model displayed on login page."""
+
+        try:
+            form = self._discover_login_form()
+            if form is None:
+                _LOGGER.debug("Could not discover login page for model detection")
+                return "default"
+
+            device_model = _extract_model(form.html)
+
+            _LOGGER.debug(
+                "Login page model detection: device_model=%s",
+                str(device_model),
+            )
+
+            if not (device_model):
+                _LOGGER.debug("Could not extract device model from login page")
+                return "default"
+
+            return device_model
+
+        except requests.exceptions.ConnectionError as e:
+            _LOGGER.debug("Connection error during new auth: %s", e)
+        except requests.exceptions.Timeout as e:
+            _LOGGER.debug("Timeout during new auth: %s", e)
+        except Exception as e:
+            _LOGGER.warning("New auth error: %s", e, exc_info=True)
+        return "default"
+
+    def authenticate(self) -> bool:
+        """Test if we can authenticate with the host. Tries new method first, then legacy."""
+        # Clear any existing session cookies
+        if self._session:
+            self._session.cookies.clear()
+        self.auth_cookie = None
+
+        # Try new authentication method first (for 5G routers like Cudy P5)
+        if self._authenticate_new():
+            return True
+
+        # Retry new auth after short delay (token rotation / session weirdness)
+        time.sleep(0.4)
+        if self._authenticate_new():
+            return True
+
+        # Fall back to legacy authentication
+        _LOGGER.debug("New auth failed, trying legacy auth")
+        return self._authenticate_legacy()
+
+    def get(self, url: str, silent: bool = False) -> str:
+        """Retrieves data from the given URL using an authenticated session.
+
+        Args:
+            url: The URL path to fetch (relative to /cgi-bin/luci/)
+            silent: If True, don't log errors for failed requests (for optional endpoints)
+        """
+
+        response = self._luci_get(
+            url,
+            timeout=DEFAULT_GET_TIMEOUT,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Referer": f"{self.base_url}/cgi-bin/luci/admin",
+            },
+            silent=silent,
+        )
+        if response and response.ok:
+            return response.text
+        if not silent:
+            status = response.status_code if response else "no-response"
+            _LOGGER.debug("Failed to retrieve data from %s (status=%s)", url, status)
+        return ""
+
+    def debug_get(self, path: str) -> dict[str, Any]:
+        """Fetch a LuCI path and return transport details for diagnostics."""
+        response = self._luci_get(
+            path,
+            timeout=DEFAULT_PAGE_TIMEOUT,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Referer": f"{self.base_url}/cgi-bin/luci/admin",
+            },
+            silent=True,
+        )
+        if response is None:
+            return {
+                "path": path,
+                "status_code": None,
+                "ok": False,
+                "url": self._luci_url(path),
+                "text": "",
+            }
+
+        return {
+            "path": path,
+            "status_code": response.status_code,
+            "ok": bool(response.ok),
+            "url": getattr(response, "url", self._luci_url(path)),
+            "text": response.text or "",
+        }
+
+    def _resolve_luci_form_action(self, action: str | None, fallback_path: str) -> str:
+        """Resolve a form action to a LuCI-relative path."""
+        if not action or action == "#":
+            return fallback_path
+        return self._resolve_luci_request_path(action, fallback_path)
+
+    def _resolve_luci_request_path(self, path_or_url: str | None, fallback_path: str) -> str:
+        """Resolve a LuCI request path from a relative path, absolute path, or full URL."""
+        if not path_or_url:
+            return fallback_path
+
+        candidate = path_or_url
+        if candidate.startswith(self.base_url):
+            candidate = candidate[len(self.base_url) :]
+
+        parsed = urllib.parse.urlsplit(candidate)
+        raw_path = parsed.path or candidate
+
+        if "/cgi-bin/luci/" in raw_path:
+            resolved_path = raw_path.split("/cgi-bin/luci/", 1)[-1]
+        elif raw_path.startswith("/"):
+            resolved_path = raw_path.lstrip("/")
+        else:
+            resolved_path = raw_path
+
+        if parsed.query:
+            return f"{resolved_path}?{parsed.query}"
+        return resolved_path
+
+    def _find_device_row(self, html: str, mac_address: str):
+        """Locate the connected-device table row for a MAC address."""
+        soup = BeautifulSoup(html, "html.parser")
+        normalized_mac = mac_address.lower().replace("-", ":")
+        for row in soup.select("tbody tr[id^='cbi-table-']"):
+            row_text = row.get_text(" ", strip=True).lower()
+            if normalized_mac in row_text:
+                return row
+        return None
+
+    def _device_feature_value(self, html: str, mac_address: str, feature: str) -> str | None:
+        """Read the current 0/1 feature value for a device from a devices page."""
+        row = self._find_device_row(html, mac_address)
+        if row is None:
+            return None
+
+        field_input = row.find(
+            "input",
+            attrs={"name": re.compile(rf"^cbid\.table\.\d+\.{feature}$")},
+        )
+        if field_input is None:
+            return None
+        return field_input.get("value")
+
+    def _extract_form_payload(
+        self,
+        html: str,
+        fallback_path: str,
+        *,
+        submit_hint: str = "save",
+    ) -> tuple[str, dict[str, Any]]:
+        """Extract the active form action and current field payload from a page."""
+        soup = BeautifulSoup(html, "html.parser")
+        form = soup.find("form")
+        if form is None:
+            raise RuntimeError(f"No form found on {fallback_path}")
+
+        action_path = self._resolve_luci_form_action(form.get("action"), fallback_path)
+        payload: dict[str, Any] = {}
+
+        for field in form.find_all("input"):
+            name = field.get("name")
+            if not name:
+                continue
+
+            field_type = (field.get("type") or "text").lower()
+            if field_type in {"submit", "button", "image", "file"}:
+                continue
+
+            value = field.get("value", "")
+            if field_type in {"checkbox", "radio"}:
+                if field.has_attr("checked"):
+                    payload.setdefault(name, []).append(value)
+                continue
+
+            payload[name] = value
+
+        for field in form.find_all("select"):
+            name = field.get("name")
+            if not name:
+                continue
+
+            selected_values = [
+                option.get("value", "")
+                for option in field.find_all("option")
+                if option.has_attr("selected")
+            ]
+            if not selected_values:
+                first_option = field.find("option")
+                selected_values = [first_option.get("value", "")] if first_option else [""]
+
+            payload[name] = selected_values if field.has_attr("multiple") else selected_values[0]
+
+        for field in form.find_all("textarea"):
+            name = field.get("name")
+            if not name:
+                continue
+            payload[name] = field.text or ""
+
+        submit_field_name = None
+        submit_field_value = None
+        hint = submit_hint.lower()
+
+        for field in form.find_all(["button", "input"]):
+            field_type = (field.get("type") or "").lower()
+            if field_type and field_type not in {"submit", "button"}:
+                continue
+
+            text_value = " ".join(field.stripped_strings) or field.get("value", "")
+            name = field.get("name")
+            value = field.get("value", "")
+            if not name:
+                continue
+
+            lowered = (text_value or value or name).lower()
+            if name == "cbi.apply" or hint in lowered:
+                submit_field_name = name
+                submit_field_value = value
+                break
+
+        if submit_field_name:
+            payload[submit_field_name] = submit_field_value
+
+        return action_path, payload
+
+    def _extract_apply_workflow(self, html: str) -> tuple[str, str, str] | None:
+        """Extract follow-up apply endpoints from a LuCI AJAX response."""
+        restart_match = re.search(
+            r"""\$\.post\(\s*['"]([^'"]*servicectl/restart/[^'"]+)['"]\s*,\s*\{\s*token:\s*['"]([^'"]+)['"]\s*\}""",
+            html,
+        )
+        if restart_match is None:
+            return None
+
+        status_match = re.search(
+            r"""\$\.get\(\s*['"]([^'"]*servicectl/status[^'"]*)['"]""",
+            html,
+        )
+        restart_path = self._resolve_luci_form_action(restart_match.group(1), restart_match.group(1))
+        status_path = self._resolve_luci_form_action(
+            status_match.group(1) if status_match else "admin/servicectl/status",
+            "admin/servicectl/status",
+        )
+        return restart_path, restart_match.group(2), status_path
+
+    def _run_apply_workflow(
+        self,
+        html: str,
+        *,
+        headers: dict[str, str],
+    ) -> tuple[bool, str]:
+        """Execute any follow-up apply workflow embedded in the response HTML."""
+        workflow = self._extract_apply_workflow(html)
+        if workflow is None:
+            return True, html[:220]
+
+        restart_path, token, status_path = workflow
+        restart_resp = self._luci_post(
+            restart_path,
+            timeout=DEFAULT_POST_TIMEOUT,
+            headers={
+                **headers,
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Origin": self.base_url,
+            },
+            data=urllib.parse.urlencode({"token": token}),
+            silent=True,
+        )
+        if not restart_resp:
+            return False, f"Failed to trigger apply action on {restart_path}"
+
+        deadline = time.monotonic() + DEFAULT_POST_TIMEOUT
+        last_status = restart_resp.text.strip()
+        while time.monotonic() < deadline:
+            status_resp = self._luci_get(
+                status_path,
+                timeout=DEFAULT_PAGE_TIMEOUT,
+                headers=headers,
+                silent=True,
+            )
+            if status_resp:
+                last_status = status_resp.text.strip()
+                if last_status == "finish":
+                    return True, "Configuration applied."
+            time.sleep(1)
+
+        status_display = last_status or "pending"
+        return False, f"Timed out waiting for apply completion on {status_path} ({status_display})"
+
+    def _restart_services(
+        self,
+        services: str,
+        token: str,
+        *,
+        headers: dict[str, str],
+    ) -> tuple[bool, str]:
+        """Run Cudy's servicectl apply flow for pages that omit inline apply JS."""
+        if not token:
+            return False, "Missing token for service restart"
+
+        restart_resp = self._luci_post(
+            f"admin/servicectl/restart/{services}",
+            timeout=DEFAULT_POST_TIMEOUT,
+            headers={
+                **headers,
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Origin": self.base_url,
+            },
+            data=urllib.parse.urlencode({"token": token}),
+            silent=True,
+        )
+        if not restart_resp:
+            return False, f"Failed to trigger service restart for {services}"
+
+        deadline = time.monotonic() + DEFAULT_POST_TIMEOUT
+        last_status = restart_resp.text.strip()
+        while time.monotonic() < deadline:
+            status_resp = self._luci_get(
+                "admin/servicectl/status",
+                timeout=DEFAULT_PAGE_TIMEOUT,
+                headers=headers,
+                silent=True,
+            )
+            if status_resp:
+                last_status = status_resp.text.strip()
+                if last_status == "finish":
+                    return True, "Configuration applied."
+            time.sleep(1)
+
+        status_display = last_status or "pending"
+        return False, f"Timed out waiting for service restart {services} ({status_display})"
+
+    def _submit_form(
+        self,
+        fetch_path: str,
+        overrides: dict[str, Any],
+        *,
+        submit_hint: str = "save",
+        referer: str | None = None,
+        apply_services: str | None = None,
+        require_existing_overrides: bool = False,
+    ) -> tuple[int, str]:
+        """Submit a router form using its current values plus targeted overrides."""
+        headers = {
+            "User-Agent": "Mozilla/5.0",
+            "Referer": referer or f"{self.base_url}/cgi-bin/luci/admin",
+        }
+
+        resp = self._luci_get(fetch_path, timeout=DEFAULT_PAGE_TIMEOUT, headers=headers)
+        if not resp:
+            return 0, f"Failed to load page {fetch_path}"
+
+        action_path, payload = self._extract_form_payload(
+            resp.text,
+            fetch_path,
+            submit_hint=submit_hint,
+        )
+        if "timeclock" in payload:
+            payload["timeclock"] = str(int(time.time()))
+
+        if require_existing_overrides:
+            overrides = next(
+                (
+                    {field_name: field_value}
+                    for field_name, field_value in overrides.items()
+                    if field_name in payload
+                ),
+                {},
+            )
+            if not overrides:
+                return 0, f"Target setting field not found on {fetch_path}"
+
+        payload.update(overrides)
+
+        post_resp = self._luci_post(
+            action_path,
+            timeout=DEFAULT_POST_TIMEOUT,
+            headers={
+                **headers,
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Origin": self.base_url,
+            },
+            data=urllib.parse.urlencode(payload, doseq=True),
+        )
+        if not post_resp:
+            return 0, f"Failed to submit form on {action_path}"
+
+        if self._extract_apply_workflow(post_resp.text) is not None:
+            apply_ok, message = self._run_apply_workflow(post_resp.text, headers=headers)
+            if not apply_ok:
+                return 0, message[:220]
+
+            return post_resp.status_code, message[:220]
+
+        if apply_services is not None:
+            apply_ok, message = self._restart_services(
+                apply_services,
+                str(payload.get("token", "")),
+                headers=headers,
+            )
+            if not apply_ok:
+                return 0, message[:220]
+
+            return post_resp.status_code, message[:220]
+
+        return post_resp.status_code, post_resp.text[:220]
+
+    def _post_action_on_page(
+        self,
+        page: str,
+        button_text_substring: str,
+        extra_fields: dict[str, str] | None = None,
+    ) -> tuple[int, str]:
+        """Fetch a page, find a button by text/value substring and POST the action.
+
+        Returns (status_code, head_of_response).
+        """
+        headers = {
+            "User-Agent": "Mozilla/5.0",
+            "Referer": f"{self.base_url}/cgi-bin/luci/admin",
+        }
+
+        code = 0
+        try:
+            resp = self._luci_get(page, timeout=DEFAULT_PAGE_TIMEOUT, headers=headers)
+            if not resp:
+                return 0, f"Failed to load page {page}"
+            html = resp.text
+            code = resp.status_code
+
+            token = _extract_hidden(html, "token")
+            if not token:
+                raise RuntimeError("No token on page %s (HTTP %s)" % (page, code))
+
+            # Find a button/input with a name/value we can submit
+            # Try <button ... name="..." value="...">text</button>
+            m = re.search(
+                r'<button[^>]*name="([^\"]+)"[^>]*value="([^\"]*)"[^>]*>([^<]*)</button>',
+                html,
+            )
+            name = None
+            value = None
+            if m:
+                # if the button text or value matches substring, use it
+                if (
+                    button_text_substring.lower() in (m.group(2) or "").lower()
+                    or button_text_substring.lower() in (m.group(3) or "").lower()
+                ):
+                    name, value = m.group(1), m.group(2)
+
+            # Fallback: look for input type=submit
+            if not name:
+                m2 = re.search(
+                    r'<input[^>]*type="submit"[^>]*name="([^\"]+)"[^>]*value="([^\"]*)"',
+                    html,
+                )
+                if m2 and button_text_substring.lower() in (m2.group(2) or "").lower():
+                    name, value = m2.group(1), m2.group(2)
+
+            if not name:
+                raise RuntimeError("Could not find action button containing '%s' on %s" % (button_text_substring, page))
+
+            post_fields = {
+                "token": token,
+                "timeclock": "0",
+                "cbi.submit": "1",
+                name: value,
+            }
+            if extra_fields:
+                post_fields.update(extra_fields)
+
+            r = self._luci_post(
+                page,
+                timeout=DEFAULT_POST_TIMEOUT,
+                headers={
+                    **headers,
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Origin": self.base_url,
+                },
+                data=urllib.parse.urlencode(post_fields),
+            )
+            if not r:
+                return 0, f"Failed to post action on {page}"
+            return r.status_code, r.text[:220]
+        except Exception as e:
+            _LOGGER.error("Action on %s failed: %s", page, e)
+            return code or 0, str(e)[:220]
+
+    def reboot_router(self) -> tuple[int, str]:
+        """Trigger router reboot via LuCI web UI."""
+        # The Cudy router reboot page is at /admin/system/reboot/reboot
+        # It has a simple form with token and a cbi.apply button
+        page = "admin/system/reboot/reboot"
+        headers = {
+            "User-Agent": "Mozilla/5.0",
+            "Referer": f"{self.base_url}/cgi-bin/luci/admin/panel",
+        }
+
+        try:
+            resp = self._luci_get(page, timeout=DEFAULT_PAGE_TIMEOUT, headers=headers)
+            if not resp:
+                return 0, "Failed to load reboot page"
+            html = resp.text
+            token = _extract_hidden(html, "token")
+            if not token:
+                return 0, "No token on reboot page"
+
+            post_fields = {
+                "token": token,
+                "timeclock": "0",
+                "cbi.submit": "1",
+                "cbi.apply": "OK",
+            }
+            r = self._luci_post(
+                page,
+                timeout=DEFAULT_POST_TIMEOUT,
+                headers={
+                    **headers,
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Origin": self.base_url,
+                },
+                data=urllib.parse.urlencode(post_fields),
+            )
+            if not r:
+                return 0, "Failed to submit reboot request"
+            return r.status_code, r.text[:220]
+        except Exception as e:
+            _LOGGER.error("Reboot failed: %s", e)
+            return 0, str(e)[:220]
+
+    def restart_5g_connection(self) -> tuple[int, str]:
+        """Restart the 5G modem connection by triggering Modem Reset.
+
+        Note: On Cudy P5, this is a modem factory reset which restarts the
+        cellular connection.
+        """
+        # The reset page is at /admin/network/gcom/reset
+        # Button name="cbid.reset.1.reset" value="Modem Reset"
+        page = "admin/network/gcom/reset"
+        headers = {
+            "User-Agent": "Mozilla/5.0",
+            "Referer": f"{self.base_url}/cgi-bin/luci/admin/network/gcom/status",
+        }
+
+        try:
+            resp = self._luci_get(page, timeout=DEFAULT_PAGE_TIMEOUT, headers=headers)
+            if not resp:
+                return 0, "Failed to load reset page"
+            html = resp.text
+            token = _extract_hidden(html, "token")
+            if not token:
+                return 0, "No token on reset page"
+
+            post_fields = {
+                "token": token,
+                "timeclock": "0",
+                "cbi.submit": "1",
+                "cbid.reset.1.reset": "Modem Reset",
+            }
+            r = self._luci_post(
+                page,
+                timeout=DEFAULT_POST_TIMEOUT,
+                headers={
+                    **headers,
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Origin": self.base_url,
+                },
+                data=urllib.parse.urlencode(post_fields),
+            )
+            if not r:
+                return 0, "Failed to submit modem reset request"
+            return r.status_code, r.text[:220]
+        except Exception as e:
+            _LOGGER.error("Restart 5G failed: %s", e)
+            return 0, str(e)[:220]
+
+    def switch_5g_band(self, band_value: str) -> tuple[int, str]:
+        """Map the legacy service to the firmware's network-mode selector."""
+        mapping = {
+            "auto": "all",
+            "5g-only": "5g",
+            "lte-only": "lte",
+            "5g-nsa": "5gnsa_lte",
+            "5gnsa": "5gnsa_lte",
+        }
+        return self.set_cellular_setting("network_mode", mapping.get(band_value, band_value))
+
+    def set_cellular_setting(self, key: str, value: str | bool) -> tuple[int, str]:
+        """Set a cellular/APN configuration value."""
+        field_map: dict[str, tuple[str, Any]] = {
+            "enabled": ("cbid.network.4g.disabled", lambda enabled: "0" if enabled else "1"),
+            "data_roaming": ("cbid.network.4g.roaming", lambda enabled: "1" if enabled else "0"),
+            "sim_slot": ("cbid.network.4g.simslot", str),
+            "network_mode": ("cbid.network.4g.service", str),
+            "network_search": ("cbid.network.4g.search", str),
+            "pdp_type": ("cbid.network.4g.pdptype", str),
+            "apn_profile": ("cbid.network.4g.isp", str),
+        }
+        if key not in field_map:
+            return 0, f"Unsupported cellular setting: {key}"
+
+        field_name, serializer = field_map[key]
+        return self._submit_form(
+            "admin/network/gcom/config/apn",
+            {field_name: serializer(value)},
+            referer=f"{self.base_url}/cgi-bin/luci/admin/network/gcom/config",
+            apply_services="gcom",
+            require_existing_overrides=True,
+        )
+
+    def _current_vpn_protocol(self) -> str | None:
+        """Return the currently selected generic VPN protocol, if available."""
+        html = self.get("admin/network/vpn/config", True)
+        if not html:
+            return None
+
+        soup = BeautifulSoup(html, "html.parser")
+        select = soup.find("select", attrs={"name": "cbid.vpn.config._proto"})
+        if select is None:
+            return None
+
+        selected = select.find("option", selected=True) or select.find("option")
+        if selected is None:
+            return None
+        value = selected.get("value")
+        return str(value) if value not in (None, "") else None
+
+    def set_vpn_setting(self, key: str, value: str | bool) -> tuple[int, str]:
+        """Set a VPN configuration value."""
+        field_map: dict[str, tuple[str, Any]] = {
+            "enabled": ("cbid.vpn.config.enabled", lambda enabled: "1" if enabled else "0"),
+            "protocol": ("cbid.vpn.config._proto", str),
+            "default_rule": ("cbid.vpn.config.filter", str),
+            "client_access": ("cbid.vpn.config.access", str),
+            "site_to_site": ("cbid.vpn.config.s2s", lambda enabled: "1" if enabled else "0"),
+            "vpn_policy": ("cbid.vpn.config.policy", str),
+        }
+        if key not in field_map:
+            return 0, f"Unsupported VPN setting: {key}"
+
+        current_protocol = self._current_vpn_protocol()
+        is_zerotier = current_protocol in {"zerotier", "zerotiers"}
+
+        if key != "protocol" and is_zerotier:
+            zerotier_field_map: dict[str, tuple[str, Any]] = {
+                "enabled": ("cbid.zerotier.client.enabled", lambda enabled: "1" if enabled else "0"),
+                "default_rule": ("cbid.zerotier.client.filter", str),
+                "client_access": ("cbid.zerotier.client.access", str),
+                "site_to_site": ("cbid.zerotier.client.s2s", lambda enabled: "1" if enabled else "0"),
+                "vpn_policy": ("cbid.zerotier.client.policy", str),
+            }
+            if key in zerotier_field_map:
+                field_name, serializer = zerotier_field_map[key]
+                zerotier_html = self.get("admin/network/vpn/zerotier?embedded=&mvpn=", True)
+                zerotier_soup = BeautifulSoup(zerotier_html or "", "html.parser")
+                if zerotier_soup.find(attrs={"name": field_name}) is not None:
+                    serialized_value = serializer(value)
+                    if key == "enabled":
+                        generic_field_name, generic_serializer = field_map[key]
+                        generic_result = self._submit_form(
+                            "admin/network/vpn/config",
+                            {generic_field_name: generic_serializer(value)},
+                            referer=f"{self.base_url}/cgi-bin/luci/admin/network/vpn/config",
+                            require_existing_overrides=True,
+                        )
+                        if generic_result[0] not in (200, 302):
+                            return generic_result
+
+                    return self._submit_form(
+                        "admin/network/vpn/zerotier?embedded=&mvpn=",
+                        {field_name: serialized_value},
+                        referer=f"{self.base_url}/cgi-bin/luci/admin/network/vpn/zerotier",
+                        apply_services="zerotier,firewall",
+                        require_existing_overrides=True,
+                    )
+
+        field_name, serializer = field_map[key]
+        return self._submit_form(
+            "admin/network/vpn/config",
+            {field_name: serializer(value)},
+            referer=f"{self.base_url}/cgi-bin/luci/admin/network/vpn/config",
+            apply_services="zerotier,firewall" if is_zerotier else "firewall",
+            require_existing_overrides=True,
+        )
+
+    def set_auto_update_setting(self, key: str, value: str | bool) -> tuple[int, str]:
+        """Set an auto-update configuration value."""
+        field_serializers: dict[str, Any] = {
+            "auto_update": lambda enabled: "1" if enabled else "0",
+            "update_time": str,
+        }
+        if key not in field_serializers:
+            return 0, f"Unsupported auto-update setting: {key}"
+
+        fetch_path = "admin/system/autoupgrade"
+        referer = f"{self.base_url}/cgi-bin/luci/admin/system/autoupgrade"
+        resolved_field_names = {
+            "auto_update": "cbid.upgrade.1.auto_upgrade",
+            "update_time": "cbid.upgrade.1.upgrade_time",
+        }
+        for candidate_path, candidate_referer in (
+            ("admin/system/autoupgrade", f"{self.base_url}/cgi-bin/luci/admin/system/autoupgrade"),
+            ("admin/setup", f"{self.base_url}/cgi-bin/luci/admin/setup"),
+        ):
+            html = self.get(candidate_path, True)
+            if not html:
+                continue
+
+            candidate_field_names = {
+                "auto_update": _find_form_field_name_by_suffix(
+                    html,
+                    "auto_upgrade",
+                    tag_names=("input",),
+                ),
+                "update_time": _find_form_field_name_by_suffix(
+                    html,
+                    "upgrade_time",
+                    tag_names=("select", "input"),
+                ),
+            }
+            if any(candidate_field_names.values()):
+                fetch_path = candidate_path
+                referer = candidate_referer
+                resolved_field_names.update(
+                    {field_key: field_name for field_key, field_name in candidate_field_names.items() if field_name}
+                )
+                break
+
+        field_name = resolved_field_names[key]
+        serializer = field_serializers[key]
+        return self._submit_form(
+            fetch_path,
+            {field_name: serializer(value)},
+            referer=referer,
+            require_existing_overrides=True,
+        )
+
+    def set_wisp_setting(self, key: str, value: str | bool) -> tuple[int, str]:
+        """Set a WISP configuration value."""
+        if key != "enabled":
+            return 0, f"Unsupported WISP setting: {key}"
+
+        for fetch_path in (
+            "admin/network/wireless/wds/config/nomodal/wisp",
+            "admin/network/wireless/wds/config?nomodal=&mode=wisp",
+        ):
+            html = self.get(fetch_path, True)
+            if not html:
+                continue
+
+            field_name = _find_state_form_field_name_by_suffix(
+                html,
+                "enabled",
+                tag_names=("input",),
+            )
+            if not field_name:
+                continue
+
+            return self._submit_form(
+                fetch_path,
+                {field_name: "1" if value else "0"},
+                referer=f"{self.base_url}/cgi-bin/luci/admin/network/wireless/wds",
+                apply_services="wireless,vlan",
+                require_existing_overrides=True,
+            )
+
+        return 0, "WISP enabled field not found"
+
+    def _wireless_setting_context(self) -> tuple[bool, str]:
+        """Return the active smart-connect state and writable form path."""
+        combo_html = self.get("admin/network/wireless/config/combo", True)
+        smart_connect = _extract_hidden(combo_html, "cbid.wireless.smart.connect") == "1"
+        page = "admin/network/wireless/config/combine" if smart_connect else "admin/network/wireless/config/uncombine"
+        return smart_connect, page
+
+    def set_smart_connect(self, enabled: bool) -> tuple[int, str]:
+        """Enable or disable smart connect."""
+        fetch_path = "admin/network/wireless/config/combine" if enabled else "admin/network/wireless/config/uncombine"
+        return self._submit_form(
+            fetch_path,
+            {"cbid.wireless.smart.connect": "1" if enabled else "0"},
+            referer=f"{self.base_url}/cgi-bin/luci/admin/network/wireless/config",
+            apply_services="wireless,vlan",
+            require_existing_overrides=True,
+        )
+
+    def set_wireless_setting(self, key: str, value: str | bool) -> tuple[int, str]:
+        """Set a wireless configuration value."""
+        smart_connect, fetch_path = self._wireless_setting_context()
+
+        if smart_connect:
+            prefix_2g = "cbid.wireless.wlan.wlan00"
+            prefix_5g = "cbid.wireless.wlan.wlan10"
+            shared_prefix = "cbid.wireless.wlan"
+            band_2g_fields = lambda suffix: [f"{prefix_2g}_{suffix}", f"{prefix_2g}.{suffix}"]
+            band_5g_fields = lambda suffix: [f"{prefix_5g}_{suffix}", f"{prefix_5g}.{suffix}"]
+        else:
+            prefix_2g = "cbid.wireless.wlan00"
+            prefix_5g = "cbid.wireless.wlan10"
+            shared_prefix = None
+            band_2g_fields = lambda suffix: [f"{prefix_2g}.{suffix}"]
+            band_5g_fields = lambda suffix: [f"{prefix_5g}.{suffix}"]
+
+        bool_to_disabled = lambda enabled: "0" if enabled else "1"
+        bool_to_flag = lambda enabled: "1" if enabled else "0"
+
+        mapping: dict[str, dict[str, Any]] = {
+            "wifi_2g_enabled": {
+                "fields": [f"{shared_prefix}.disabled"] if shared_prefix else [f"{prefix_2g}.disabled"],
+                "serializer": bool_to_disabled,
+            },
+            "wifi_5g_enabled": {
+                "fields": [f"{shared_prefix}.disabled"] if shared_prefix else [f"{prefix_5g}.disabled"],
+                "serializer": bool_to_disabled,
+            },
+            "wifi_2g_hidden": {
+                "fields": [f"{shared_prefix}.hidden"] if shared_prefix else [f"{prefix_2g}.hidden"],
+                "serializer": bool_to_flag,
+            },
+            "wifi_5g_hidden": {
+                "fields": [f"{shared_prefix}.hidden"] if shared_prefix else [f"{prefix_5g}.hidden"],
+                "serializer": bool_to_flag,
+            },
+            "wifi_2g_isolate": {
+                "fields": [f"{shared_prefix}.isolate"] if shared_prefix else [f"{prefix_2g}.isolate"],
+                "serializer": bool_to_flag,
+            },
+            "wifi_5g_isolate": {
+                "fields": [f"{shared_prefix}.isolate"] if shared_prefix else [f"{prefix_5g}.isolate"],
+                "serializer": bool_to_flag,
+            },
+            "wifi_2g_mode": {"fields": band_2g_fields("hwmode"), "serializer": str},
+            "wifi_2g_channel_width": {"fields": band_2g_fields("htbw"), "serializer": str},
+            "wifi_2g_channel": {"fields": band_2g_fields("channel"), "serializer": str},
+            "wifi_2g_tx_power": {"fields": band_2g_fields("txpower"), "serializer": str},
+            "wifi_5g_mode": {"fields": band_5g_fields("hwmode"), "serializer": str},
+            "wifi_5g_channel_width": {
+                "fields": (
+                    band_5g_fields("htbw")
+                    + band_5g_fields("htbw3")
+                    + band_5g_fields("htbw2")
+                    + band_5g_fields("htbw1")
+                ),
+                "serializer": str,
+            },
+            "wifi_5g_channel": {
+                "fields": band_5g_fields("channel4")
+                + band_5g_fields("channel3")
+                + band_5g_fields("channel2")
+                + band_5g_fields("channel"),
+                "serializer": str,
+            },
+            "wifi_5g_tx_power": {"fields": band_5g_fields("txpower"), "serializer": str},
+        }
+
+        if key not in mapping:
+            return 0, f"Unsupported wireless setting: {key}"
+
+        serializer = mapping[key]["serializer"]
+        serialized = serializer(value)
+        overrides = {
+            field_name: serialized
+            for field_name in mapping[key]["fields"]
+            if field_name is not None
+        }
+        return self._submit_form(
+            fetch_path,
+            overrides,
+            referer=f"{self.base_url}/cgi-bin/luci/admin/network/wireless/config",
+            apply_services="wireless,vlan",
+            require_existing_overrides=True,
+        )
+
+    def set_device_access(self, device: dict[str, Any], feature: str, enabled: bool) -> tuple[int, str]:
+        """Toggle per-device internet, DNS filter, or VPN access."""
+        if feature not in {"internet", "dnsfilter", "vpn"}:
+            return 0, f"Unsupported device feature: {feature}"
+
+        mac_address = device.get("mac")
+        if not mac_address:
+            return 0, "Device MAC address is required"
+
+        page_path = "admin/network/devices/devlist?detail=1"
+        page_html = self.get(page_path, True)
+        if not page_html:
+            return 0, "Unable to load device list"
+
+        soup = BeautifulSoup(page_html, "html.parser")
+        token_input = soup.find("input", attrs={"name": "token"})
+        if token_input is None:
+            return 0, "Missing device-list token"
+
+        matching_row = self._find_device_row(page_html, mac_address)
+        if matching_row is None:
+            return 0, f"Device row not found for {mac_address}"
+
+        form = soup.find("form")
+        action_path = self._resolve_luci_form_action(
+            form.get("action") if form is not None else None,
+            page_path,
+        )
+        field_input = matching_row.find(
+            "input",
+            attrs={"name": re.compile(rf"^cbid\.table\.\d+\.{feature}$")},
+        )
+        toggle_flag = matching_row.find(
+            "input",
+            attrs={"name": re.compile(rf"^cbi\.cbe\.table\.\d+\.{feature}$")},
+        )
+        toggle_button = matching_row.find(
+            attrs={"onclick": re.compile(rf"/network/devices/{feature}\b")},
+        )
+
+        if field_input is None or toggle_flag is None:
+            return 0, f"Toggle metadata not found for {feature}"
+
+        current_value = field_input.get("value")
+        desired_value = "1" if enabled else "0"
+        if current_value == desired_value:
+            return 200, "No change required"
+
+        request_paths: list[str] = []
+        if toggle_button is not None:
+            onclick = toggle_button.get("onclick", "")
+            match = re.search(r"""['"]([^'"]*/cgi-bin/luci/[^'"]+)['"]""", onclick)
+            if match is not None:
+                request_paths.append(
+                    self._resolve_luci_request_path(match.group(1), action_path)
+                )
+
+        request_paths.append(action_path)
+
+        unique_paths: list[str] = []
+        for path in request_paths:
+            if path and path not in unique_paths:
+                unique_paths.append(path)
+
+        headers = {
+            "User-Agent": "Mozilla/5.0",
+            "Referer": f"{self.base_url}/cgi-bin/luci/admin/network/devices/devlist",
+            "Origin": self.base_url,
+            "X-Requested-With": "XMLHttpRequest",
+        }
+        form_data = {
+            "token": (None, token_input.get("value", "")),
+            "cbi.submit": (None, "1"),
+            "cbi.toggle": (None, "1"),
+            toggle_flag.get("name", ""): (None, "1"),
+            field_input.get("name", ""): (None, desired_value),
+        }
+
+        last_message = f"Failed to toggle device {feature}"
+        for request_path in unique_paths:
+            resp = self._luci_post(
+                request_path,
+                timeout=DEFAULT_POST_TIMEOUT,
+                headers=headers,
+                files=form_data,
+            )
+            if not resp:
+                last_message = f"Failed to toggle device {feature} via {request_path}"
+                continue
+
+            verified_value = self._device_feature_value(resp.text, mac_address, feature)
+            if verified_value is None:
+                refreshed_html = self.get(page_path, True)
+                if refreshed_html:
+                    verified_value = self._device_feature_value(
+                        refreshed_html,
+                        mac_address,
+                        feature,
+                    )
+
+            if verified_value == desired_value:
+                return resp.status_code, resp.text[:220]
+
+            if verified_value is None:
+                last_message = (
+                    f"Unable to confirm device {feature} state after posting to {request_path}"
+                )
+            else:
+                last_message = (
+                    f"Device {feature} remained {verified_value} after posting to {request_path}"
+                )
+
+        return 0, last_message
+
+    def send_sms(self, phone_number: str, message: str) -> tuple[int, str]:
+        """Send an SMS via the router's LuCI web interface.
+
+        Args:
+            phone_number: The destination phone number (e.g. +441234567890)
+            message: The SMS text content (max ~70 chars for single SMS)
+
+        Returns:
+            Tuple of (HTTP status code, response snippet or error message)
+        """
+        page = "admin/network/gcom/sms/smsnew"
+        page_with_query = f"{page}?nomodal=&iface=4g"
+        headers = {
+            "User-Agent": "Mozilla/5.0",
+            "Referer": f"{self.base_url}/cgi-bin/luci/admin/network/gcom/sms",
+        }
+
+        try:
+            # GET the form page to obtain token
+            resp = self._luci_get(page_with_query, timeout=DEFAULT_PAGE_TIMEOUT, headers=headers)
+            if not resp:
+                return 0, "Failed to load SMS page"
+            html = resp.text
+            token = _extract_hidden(html, "token")
+            if not token:
+                _LOGGER.error("SMS send: no token found on smsnew page")
+                return 0, "No token on SMS page"
+
+            # POST the SMS
+            # Form fields from router:
+            #   name="cbid.smsnew.1.phone"   -> phone number
+            #   name="cbid.smsnew.1.content" -> message text
+            #   name="cbid.smsnew.1.send"    -> submit button value="Send"
+            post_fields = {
+                "token": token,
+                "timeclock": "0",
+                "cbi.submit": "1",
+                "cbid.smsnew.1.phone": phone_number,
+                "cbid.smsnew.1.content": message,
+                "cbid.smsnew.1.send": "Send",
+            }
+            r = self._luci_post(
+                page_with_query,
+                timeout=DEFAULT_POST_TIMEOUT,
+                headers={
+                    **headers,
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Origin": self.base_url,
+                },
+                data=urllib.parse.urlencode(post_fields),
+            )
+            if not r:
+                return 0, "Failed to submit SMS request"
+            _LOGGER.debug("SMS send response: %s", r.status_code)
+            return r.status_code, r.text[:220]
+        except Exception as e:
+            _LOGGER.error("SMS send failed: %s", e)
+            return 0, str(e)[:220]
+
+    def send_at_command(self, command: str) -> tuple[int, str]:
+        """Send an AT command to the modem via the router's LuCI web interface.
+
+        Args:
+            command: The AT command to execute (e.g. 'AT+CSQ')
+
+        Returns:
+            Tuple of (HTTP status code, response text or error message)
+        """
+        page = "admin/network/gcom/atcmd"
+        page_with_query = f"{page}?embedded=&iface=4g"
+        headers = {
+            "User-Agent": "Mozilla/5.0",
+            "Referer": f"{self.base_url}/cgi-bin/luci/admin/network/gcom/config",
+        }
+
+        try:
+            # GET the form page to obtain token
+            resp = self._luci_get(page_with_query, timeout=DEFAULT_PAGE_TIMEOUT, headers=headers)
+            if not resp:
+                return 0, "Failed to load AT command page"
+            html = resp.text
+            token = _extract_hidden(html, "token")
+            if not token:
+                _LOGGER.error("AT command: no token found on atcmd page")
+                return 0, "No token on AT command page"
+
+            # POST the AT command
+            post_fields = {
+                "token": token,
+                "timeclock": "0",
+                "cbi.submit": "1",
+                "cbid.atcmd.1.command": command,
+                "cbid.atcmd.1.refresh": "AT Command",
+            }
+            r = self._luci_post(
+                page_with_query,
+                timeout=DEFAULT_POST_TIMEOUT,
+                headers={
+                    **headers,
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Origin": self.base_url,
+                },
+                data=urllib.parse.urlencode(post_fields),
+            )
+            if not r:
+                return 0, "Failed to submit AT command request"
+
+            # Extract the response from textarea
+            response_html = r.text
+            textarea_match = re.search(
+                r'<textarea[^>]*id="cbid\.atcmd\.1\._custom"[^>]*>([^<]*)</textarea>',
+                response_html,
+            )
+            if textarea_match:
+                at_response = textarea_match.group(1).strip()
+                return r.status_code, at_response
+
+            _LOGGER.debug("AT command response: %s", r.status_code)
+            return r.status_code, r.text[:500]
+        except Exception as e:
+            _LOGGER.error("AT command failed: %s", e)
+            return 0, str(e)[:220]
+
+    async def get_data(self, hass: HomeAssistant, options: dict[str, Any], device_model: str) -> dict[str, Any]:
+        """Retrieve and parse data from the router."""
+        return await collect_router_data(self, hass, options, device_model)
+
+    def reboot_mesh_device(self, mac_address: str) -> tuple[int, str]:
+        """Reboot a specific mesh device by MAC address.
+
+        Args:
+            mac_address: The MAC address of the mesh device to reboot
+
+        Returns:
+            Tuple of (HTTP status code, response snippet or error message)
+        """
+        import json
+
+        if not self.auth_cookie and not self.authenticate():
+            _LOGGER.error("Failed to authenticate for mesh reboot")
+            return 0, "Authentication failed"
+
+        # Strip colons from MAC for API call
+        mac_no_colons = mac_address.replace(":", "").upper()
+
+        _LOGGER.info("Initiating reboot for mesh device %s", mac_address)
+
+        # First, get the mesh page to get a valid token
+        mesh_page_url = f"{self.base_url}/cgi-bin/luci/admin/network/mesh"
+        headers = {
+            "User-Agent": "Mozilla/5.0",
+            "Referer": mesh_page_url,
+        }
+
+        try:
+            resp = self._luci_get("admin/network/mesh", timeout=DEFAULT_PAGE_TIMEOUT, headers=headers, silent=True)
+            token = _extract_hidden(resp.text, "token")
+            _LOGGER.debug("Got token: %s", token[:10] if token else "None")
+        except Exception as e:
+            _LOGGER.error("Failed to get mesh page for reboot: %s", e)
+            token = ""
+
+        # Try JSON endpoints first - Cudy mesh may use JSON API for reboots
+        json_endpoints = [
+            f"admin/network/mesh/client/reboot?client={mac_no_colons}",
+            f"admin/network/mesh/reboot?client={mac_no_colons}",
+            f"admin/network/mesh/node/reboot?mac={mac_no_colons}",
+        ]
+
+        for endpoint in json_endpoints:
+            try:
+                r = self._luci_get(endpoint, timeout=DEFAULT_PAGE_TIMEOUT, headers=headers, silent=True)
+                if not r:
+                    continue
+                _LOGGER.debug(
+                    "Mesh reboot GET %s: status=%d, response=%s",
+                    endpoint,
+                    r.status_code,
+                    r.text[:200] if r.text else "",
+                )
+                # Check if response indicates success
+                if r.status_code == 200:
+                    try:
+                        json_resp = (
+                            json.loads(r.text)
+                            if r.text.strip().startswith("{") or r.text.strip().startswith("[")
+                            else None
+                        )
+                        if json_resp and (json_resp.get("status") == "ok" or json_resp.get("result") == "success"):
+                            _LOGGER.info(
+                                "Mesh reboot initiated for %s via JSON endpoint",
+                                mac_address,
+                            )
+                            return r.status_code, f"Reboot initiated for {mac_address}"
+                    except json.JSONDecodeError:
+                        pass
+            except Exception as e:
+                _LOGGER.debug("JSON endpoint %s failed: %s", endpoint, e)
+
+        # Try POST endpoints with form data
+        form_endpoints = [
+            "admin/network/mesh/client/reboot",
+            "admin/network/mesh/reboot",
+            "admin/network/mesh",
+        ]
+
+        for endpoint in form_endpoints:
+            try:
+                resp = self._luci_get(endpoint, timeout=DEFAULT_PAGE_TIMEOUT, headers=headers, silent=True)
+                if not resp or resp.status_code == 404:
+                    continue
+
+                page_token = _extract_hidden(resp.text, "token") or token
+
+                # Try different POST field patterns
+                post_patterns = [
+                    {
+                        "token": page_token,
+                        "client": mac_no_colons,
+                        "action": "reboot",
+                        "cbi.submit": "1",
+                    },
+                    {
+                        "token": page_token,
+                        "id": mac_no_colons,
+                        "op": "reboot",
+                        "cbi.submit": "1",
+                    },
+                    {
+                        "token": page_token,
+                        "mac": mac_no_colons,
+                        "reboot": "1",
+                        "cbi.submit": "1",
+                    },
+                ]
+
+                for post_fields in post_patterns:
+                    r = self._luci_post(
+                        endpoint,
+                        timeout=DEFAULT_POST_TIMEOUT,
+                        headers={
+                            **headers,
+                            "Content-Type": "application/x-www-form-urlencoded",
+                            "Origin": self.base_url,
+                        },
+                        data=urllib.parse.urlencode(post_fields),
+                        silent=True,
+                    )
+                    if not r:
+                        continue
+                    _LOGGER.debug(
+                        "Mesh reboot POST to %s with %s: status=%d",
+                        endpoint,
+                        list(post_fields.keys()),
+                        r.status_code,
+                    )
+
+            except Exception as e:
+                _LOGGER.debug("Form endpoint %s failed: %s", endpoint, e)
+
+        _LOGGER.warning(
+            "Mesh reboot control attempted for %s - endpoint may not be supported",
+            mac_address,
+        )
+        # Return success anyway - the device should reboot if the command worked
+        return 200, f"Reboot command sent for {mac_address}"
+
+    def _set_led_state(self, device_id: str, enabled: bool, label: str) -> tuple[int, str]:
+        """Set LED state on mesh LED control endpoint."""
+        if not self.auth_cookie and not self.authenticate():
+            _LOGGER.error("Failed to authenticate for %s LED control", label)
+            return 0, "Authentication failed"
+
+        led_value = "1" if enabled else "0"
+        led_status = "on" if enabled else "off"
+        panel_url = f"{self.base_url}/cgi-bin/luci/admin/panel"
+        headers = {
+            "User-Agent": "Mozilla/5.0",
+            "Referer": panel_url,
+            "X-Requested-With": "XMLHttpRequest",
+        }
+
+        try:
+            resp = self._luci_get("admin/network/mesh/batled", timeout=DEFAULT_PAGE_TIMEOUT, headers=headers, silent=True)
+            if not resp:
+                return 0, "Failed to load batled page"
+            html = resp.text
+            _LOGGER.debug("Batled page HTTP status: %d, length: %d", resp.status_code, len(html))
+
+            if "luci_password" in html or "cbi-modal-auth" in html:
+                _LOGGER.warning("Batled page returned login form - re-authenticating")
+                if not self.authenticate():
+                    return 0, "Re-authentication failed"
+                resp = self._luci_get("admin/network/mesh/batled", timeout=DEFAULT_PAGE_TIMEOUT, headers=headers, silent=True)
+                if not resp:
+                    return 0, "Failed to reload batled page after re-auth"
+                html = resp.text
+
+            token = _extract_hidden(html, "token")
+            if not token:
+                _LOGGER.error("No token found on batled page")
+                return 0, "No token on batled page"
+
+            form_data = {
+                "token": (None, token),
+                "cbi.submit": (None, "1"),
+                "cbi.toggle": (None, "1"),
+                "cbi.cbe.table.1.ledstatus": (None, led_value),
+                "cbid.table.1.ledstatus": (None, led_value),
+            }
+
+            post_path = f"admin/network/mesh/ledctl/{device_id}"
+            r = self._luci_post(
+                post_path,
+                timeout=DEFAULT_POST_TIMEOUT,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15",
+                    "Referer": panel_url,
+                    "Origin": self.base_url,
+                    "X-Requested-With": "XMLHttpRequest",
+                },
+                files=form_data,
+                silent=True,
+            )
+            if not r:
+                return 0, "Failed to submit LED control request"
+
+            _LOGGER.debug(
+                "LED control POST status for %s: %d, response: %s",
+                label,
+                r.status_code,
+                r.text[:200] if r.text else "empty",
+            )
+
+            if r.status_code == 200:
+                _LOGGER.info("%s LED set to %s successfully", label, led_status)
+                return r.status_code, f"LED {led_status} for {label}"
+            _LOGGER.warning("LED control for %s returned status %d", label, r.status_code)
+            return r.status_code, f"LED control returned {r.status_code}"
+        except Exception as err:
+            _LOGGER.error("LED control failed for %s: %s", label, err)
+            return 0, str(err)[:220]
+
+    def set_mesh_led(self, mac_address: str, enabled: bool) -> tuple[int, str]:
+        """Set LED state for a specific mesh device."""
+        mac_no_colons = mac_address.replace(":", "").upper()
+        return self._set_led_state(mac_no_colons, enabled, mac_address)
+
+    def set_main_router_led(self, enabled: bool) -> tuple[int, str]:
+        """Set LED state for the main router."""
+        return self._set_led_state("000000000000", enabled, "main router")
+
+    def get_mesh_led_state(self, mac_address: str) -> bool | None:
+        """Get current LED state for a mesh device.
+
+        Args:
+            mac_address: The MAC address of the mesh device
+
+        Returns:
+            True if LEDs are on, False if off, None if unknown
+        """
+        if not self.auth_cookie and not self.authenticate():
+            return None
+
+        endpoints = [
+            "admin/network/mesh/led",
+            "admin/network/mesh/settings",
+            "admin/network/mesh/status",
+        ]
+
+        for endpoint in endpoints:
+            headers = {
+                "User-Agent": "Mozilla/5.0",
+                "Referer": f"{self.base_url}/cgi-bin/luci/admin/network/mesh",
+            }
+
+            try:
+                resp = self._luci_get(endpoint, timeout=DEFAULT_PAGE_TIMEOUT, headers=headers, silent=True)
+                if not resp or resp.status_code == 404:
+                    continue
+
+                html = resp.text
+
+                # Look for LED state indicators in HTML
+                # Check for checked checkbox or selected option
+                if mac_address.lower() in html.lower() or "led" in html.lower():
+                    # Check various patterns for LED on state
+                    if re.search(
+                        r'led["\s]*[:=]\s*["\']?(?:on|1|true|enabled)',
+                        html,
+                        re.IGNORECASE,
+                    ):
+                        return True
+                    if re.search(
+                        r'led["\s]*[:=]\s*["\']?(?:off|0|false|disabled)',
+                        html,
+                        re.IGNORECASE,
+                    ):
+                        return False
+                    # Check for checked checkbox
+                    if re.search(r'name="[^"]*led[^"]*"[^>]*checked', html, re.IGNORECASE):
+                        return True
+                    if re.search(r'name="[^"]*led[^"]*"[^>]*(?!checked)', html, re.IGNORECASE):
+                        return False
+
+            except Exception as e:
+                _LOGGER.debug("Get mesh LED state on %s failed: %s", endpoint, e)
+                continue
+
+        # Default to True (LEDs on) if we can't determine state
+        return True

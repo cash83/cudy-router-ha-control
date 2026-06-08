@@ -1,0 +1,551 @@
+"""Parser coverage for configurable router settings pages."""
+
+from __future__ import annotations
+
+from tests.module_loader import load_cudy_module
+
+
+parser = load_cudy_module("parser")
+parser_settings = load_cudy_module("parser_settings")
+
+
+def test_parse_devices_extracts_client_access_flags_from_modern_rows() -> None:
+    """Modern device rows should capture internet, DNS filter, and VPN states."""
+    html = """
+    <table class="table">
+      <tbody>
+        <tr id="cbi-table-1">
+          <td>1</td>
+          <td><p class="hidden-xs">Home Assistant <span>wifi</span></p></td>
+          <td>ignore</td>
+          <td>ignore</td>
+          <td><p class="hidden-xs">192.168.10.55 <span>AA:BB:CC:DD:EE:FF</span></p></td>
+          <td><p class="hidden-xs">Up: 1 Mbps Down: 8 Mbps</p></td>
+          <td><p class="hidden-xs">-58 dBm</p></td>
+          <td><p class="hidden-xs">00:21:46</p></td>
+          <td>
+            <input type="hidden" name="cbid.table.1.internet" value="0" />
+          </td>
+          <td>
+            <input type="hidden" name="cbid.table.1.dnsfilter" value="1" />
+          </td>
+          <td>
+            <input type="hidden" name="cbid.table.1.vpn" value="0" />
+          </td>
+        </tr>
+      </tbody>
+    </table>
+    """
+
+    parsed = parser.parse_devices(html, "")
+    device = parsed["device_list"][0]
+
+    assert device["internet"] is False
+    assert device["dnsfilter"] is True
+    assert device["vpn"] is False
+    assert device["connection_type"] == "wifi"
+    assert device["signal"] == "-58 dBm"
+    assert device["online_time"] == "00:21:46"
+
+
+def test_parse_devices_prefers_cbid_state_over_toggle_flag_inputs() -> None:
+    """Per-client access parsing should read the actual cbid state, not the always-on toggle flag."""
+    html = """
+    <table class="table">
+      <tbody>
+        <tr id="cbi-table-11">
+          <td>11</td>
+          <td><p class="hidden-xs">iPhone <span>Mesh</span></p></td>
+          <td>ignore</td>
+          <td>ignore</td>
+          <td><p class="hidden-xs">192.168.10.121 <span>2A:3D:68:F8:DC:E9</span></p></td>
+          <td><p class="hidden-xs">Up: 0 Kbps Down: 0 Kbps</p></td>
+          <td><p class="hidden-xs">-62 dBm</p></td>
+          <td><p class="hidden-xs">00:16:03</p></td>
+          <td>
+            <input type="hidden" name="cbi.cbe.table.11.internet" value="1" />
+            <input type="hidden" name="cbid.table.11.internet" value="0" />
+          </td>
+          <td>
+            <input type="hidden" name="cbi.cbe.table.11.dnsfilter" value="1" />
+            <input type="hidden" name="cbid.table.11.dnsfilter" value="0" />
+          </td>
+          <td>
+            <input type="hidden" name="cbi.cbe.table.11.vpn" value="1" />
+            <input type="hidden" name="cbid.table.11.vpn" value="0" />
+          </td>
+        </tr>
+      </tbody>
+    </table>
+    """
+
+    parsed = parser.parse_devices(html, "")
+    device = parsed["device_list"][0]
+
+    assert device["internet"] is False
+    assert device["dnsfilter"] is False
+    assert device["vpn"] is False
+
+
+def test_parse_devices_merges_legacy_and_modern_views_for_same_row() -> None:
+    """Legacy div parsing must not discard richer modern row fields."""
+    html = """
+    <table class="table table-striped">
+      <tbody>
+        <tr id="cbi-table-1">
+          <td class="hidden-xs"><div id="cbi-table-1-idx"><p class="visible-xs">1</p></div></td>
+          <td class="hidden-xs">
+            <div id="cbi-table-1-hostname">
+              <p class="visible-xs">Living-Room<br /><span class="text-primary">5G WiFi</span></p>
+            </div>
+          </td>
+          <td class="visible-xs">
+            <div id="cbi-table-1-hostnamexs">
+              <p class="visible-xs">Living-Room<br />192.168.10.14</p>
+            </div>
+          </td>
+          <td class="hidden-xs"><div id="cbi-table-1-icon"></div></td>
+          <td class="hidden-xs">
+            <div id="cbi-table-1-ipmac">
+              <p class="visible-xs">192.168.10.14<br />8C:26:AA:DB:27:A4</p>
+            </div>
+          </td>
+          <td class="hidden-xs">
+            <div id="cbi-table-1-speed">
+              <p class="visible-xs"><i></i> 0.00 Kbps<br /><i></i> 0.00 Kbps</p>
+            </div>
+          </td>
+          <td class="hidden-xs"><div id="cbi-table-1-signal"><p class="visible-xs">-71 dBm</p></div></td>
+          <td class="hidden-xs"><div id="cbi-table-1-online"><p class="visible-xs">1 Day 12:48:01</p></div></td>
+          <td>
+            <div id="cbi-table-1-internet">
+              <input type="hidden" value="1" name="cbi.cbe.table.1.internet" />
+              <input type="hidden" id="cbid.table.1.internet" name="cbid.table.1.internet" value="1" />
+            </div>
+          </td>
+          <td>
+            <div id="cbi-table-1-dnsfilter">
+              <input type="hidden" value="0" name="cbi.cbe.table.1.dnsfilter" />
+              <input type="hidden" id="cbid.table.1.dnsfilter" name="cbid.table.1.dnsfilter" value="0" />
+            </div>
+          </td>
+        </tr>
+      </tbody>
+    </table>
+    """
+
+    parsed = parser.parse_devices(html, "")
+    device = parsed["device_list"][0]
+
+    assert len(parsed["device_list"]) == 1
+    assert device["hostname"] == "Living-Room"
+    assert device["connection_type"] == "5G WiFi"
+    assert device["signal"] == "-71 dBm"
+    assert device["online_time"] == "1 Day 12:48:01"
+    assert device["internet"] is True
+    assert device["dnsfilter"] is False
+
+
+def test_parse_devices_legacy_rows_keep_client_access_flags_without_modern_columns() -> None:
+    """Legacy WR3000S-style rows should still expose VPN state when the modern parser cannot run."""
+    html = """
+    <table class="table table-striped">
+      <tbody>
+        <tr id="cbi-table-7">
+          <td>
+            <div id="cbi-table-7-hostname">
+              <p class="visible-xs">Hallway Camera<br /><span class="text-primary">2.4G WiFi</span></p>
+            </div>
+          </td>
+          <td>
+            <div id="cbi-table-7-ipmac">
+              <p class="visible-xs">192.168.10.77<br />AA:BB:CC:DD:EE:77</p>
+            </div>
+          </td>
+          <td>
+            <div id="cbi-table-7-speed">
+              <p class="visible-xs">1.00 Kbps<br />5.00 Kbps</p>
+            </div>
+          </td>
+          <td>
+            <div id="cbi-table-7-internet">
+              <input type="hidden" name="cbid.table.7.internet" value="1" />
+            </div>
+          </td>
+          <td>
+            <div id="cbi-table-7-vpn">
+              <input type="hidden" name="cbid.table.7.vpn" value="1" />
+            </div>
+          </td>
+        </tr>
+      </tbody>
+    </table>
+    """
+
+    parsed = parser.parse_devices(html, "")
+    device = parsed["device_list"][0]
+
+    assert len(parsed["device_list"]) == 1
+    assert device["hostname"] == "Hallway Camera"
+    assert device["connection_type"] == "2.4G WiFi"
+    assert device["internet"] is True
+    assert device["vpn"] is True
+
+
+def test_parse_devices_merges_same_row_when_legacy_and_modern_mac_formats_differ() -> None:
+    """Rows should dedupe even when visible and hidden layouts format the MAC differently."""
+    html = """
+    <table class="table table-striped">
+      <tbody>
+        <tr id="cbi-table-3">
+          <td class="hidden-xs"><div id="cbi-table-3-idx"><p class="visible-xs">3</p></div></td>
+          <td class="hidden-xs">
+            <div id="cbi-table-3-hostname">
+              <p class="form-control-static hidden-xs">Bedroom Speaker<br /><span class="text-primary">2.4G WiFi</span></p>
+              <p class="visible-xs">Bedroom Speaker<br /><span class="text-primary">2.4G WiFi</span></p>
+            </div>
+          </td>
+          <td class="visible-xs">
+            <div id="cbi-table-3-hostnamexs">
+              <p class="visible-xs">Bedroom Speaker<br />192.168.10.88</p>
+            </div>
+          </td>
+          <td class="hidden-xs"><div id="cbi-table-3-icon"></div></td>
+          <td class="hidden-xs">
+            <div id="cbi-table-3-ipmac">
+              <p class="form-control-static hidden-xs">192.168.10.88<br />AA:BB:CC:DD:EE:88</p>
+              <p class="visible-xs">192.168.10.88<br />AA-BB-CC-DD-EE-88</p>
+            </div>
+          </td>
+          <td class="hidden-xs">
+            <div id="cbi-table-3-speed">
+              <p class="visible-xs"><i></i> 0.50 Kbps<br /><i></i> 1.00 Kbps</p>
+            </div>
+          </td>
+          <td class="hidden-xs"><div id="cbi-table-3-signal"><p class="visible-xs">-60 dBm</p></div></td>
+          <td class="hidden-xs"><div id="cbi-table-3-online"><p class="visible-xs">00:09:12</p></div></td>
+          <td>
+            <div id="cbi-table-3-internet">
+              <input type="hidden" value="1" name="cbi.cbe.table.3.internet" />
+              <input type="hidden" id="cbid.table.3.internet" name="cbid.table.3.internet" value="1" />
+            </div>
+          </td>
+          <td>
+            <div id="cbi-table-3-vpn">
+              <input type="hidden" value="1" name="cbi.cbe.table.3.vpn" />
+              <input type="hidden" id="cbid.table.3.vpn" name="cbid.table.3.vpn" value="1" />
+            </div>
+          </td>
+        </tr>
+      </tbody>
+    </table>
+    """
+
+    parsed = parser.parse_devices(html, "")
+    device = parsed["device_list"][0]
+
+    assert len(parsed["device_list"]) == 1
+    assert device["hostname"] == "Bedroom Speaker"
+    assert device["connection_type"] == "2.4G WiFi"
+    assert device["signal"] == "-60 dBm"
+    assert device["vpn"] is True
+
+
+def test_parse_devices_accepts_picker_style_device_lists() -> None:
+    """Manual picker MAC lists should still populate the detailed device mapping."""
+    html = """
+    <table class="table">
+      <tbody>
+        <tr id="cbi-table-1">
+          <td>1</td>
+          <td><p class="hidden-xs">HomePod <span>wifi</span></p></td>
+          <td>ignore</td>
+          <td>ignore</td>
+          <td><p class="hidden-xs">192.168.10.60 <span>AA:BB:CC:DD:EE:60</span></p></td>
+          <td><p class="hidden-xs">Up: 1 Mbps Down: 8 Mbps</p></td>
+        </tr>
+      </tbody>
+    </table>
+    """
+
+    parsed = parser.parse_devices(html, ["aabbccddee60"])
+
+    assert parsed["detailed"]["AA:BB:CC:DD:EE:60"]["hostname"] == "HomePod"
+
+
+def test_parse_cellular_settings_reads_current_values_and_options() -> None:
+    """Cellular parser should normalize key APN settings."""
+    html = """
+    <form>
+      <input type="hidden" name="cbid.network.4g.disabled" value="0" />
+      <input type="hidden" name="cbid.network.4g.roaming" value="1" />
+      <select name="cbid.network.4g.simslot">
+        <option value="0">Auto</option>
+        <option value="1" selected="selected">1</option>
+        <option value="2">2</option>
+      </select>
+      <select name="cbid.network.4g.service">
+        <option value="lte">4G only</option>
+        <option value="5g">5G-SA only</option>
+        <option value="5gnsa_lte" selected="selected">5G-NSA</option>
+        <option value="all">Auto</option>
+      </select>
+      <select name="cbid.network.4g.search">
+        <option value="auto" selected="selected">Auto</option>
+        <option value="manual">Manual</option>
+      </select>
+      <select name="cbid.network.4g.isp">
+        <option value="custom">Custom</option>
+        <option value="vodafone" selected="selected">Vodafone</option>
+      </select>
+      <select name="cbid.network.4g.pdptype">
+        <option value="ip" selected="selected">IPv4</option>
+        <option value="ipv4v6">IPv4/IPv6</option>
+      </select>
+    </form>
+    """
+
+    parsed = parser_settings.parse_cellular_settings(html)
+
+    assert parsed["enabled"]["value"] is True
+    assert parsed["data_roaming"]["value"] is True
+    assert parsed["sim_slot"]["value"] == "1"
+    assert parsed["sim_slot"]["options"]["1"] == "Sim 1"
+    assert parsed["network_mode"]["value"] == "5gnsa_lte"
+    assert parsed["network_mode"]["options"]["5gnsa_lte"] == "5G-NSA"
+    assert parsed["network_search"]["value"] == "auto"
+    assert parsed["apn_profile"]["value"] == "vodafone"
+    assert parsed["pdp_type"]["value"] == "ip"
+
+
+def test_parse_wireless_settings_merges_smart_connect_specific_forms() -> None:
+    """Wireless parser should expose canonical keys regardless of page variant."""
+    combo_html = """
+    <form>
+      <input type="hidden" name="cbid.wireless.smart.connect" value="0" />
+    </form>
+    """
+    combine_html = "<form></form>"
+    uncombine_html = """
+    <form>
+      <input type="hidden" name="cbid.wireless.wlan00.disabled" value="0" />
+      <input type="hidden" name="cbid.wireless.wlan10.disabled" value="1" />
+      <input type="hidden" name="cbid.wireless.wlan00.hidden" value="1" />
+      <input type="hidden" name="cbid.wireless.wlan10.hidden" value="0" />
+      <input type="hidden" name="cbid.wireless.wlan00.isolate" value="0" />
+      <input type="hidden" name="cbid.wireless.wlan10.isolate" value="1" />
+      <select name="cbid.wireless.wlan00.hwmode">
+        <option value="11bgnax" selected="selected">2.4GHz (802.11b+g+n+ax)</option>
+      </select>
+      <select name="cbid.wireless.wlan00.htbw">
+        <option value="auto" selected="selected">Auto</option>
+      </select>
+      <select name="cbid.wireless.wlan00.channel">
+        <option value="0" selected="selected">Auto</option>
+        <option value="6">6 (2437 MHz)</option>
+      </select>
+      <select name="cbid.wireless.wlan00.txpower">
+        <option value="100" selected="selected">Maximum</option>
+      </select>
+      <select name="cbid.wireless.wlan10.hwmode">
+        <option value="11anacax" selected="selected">5GHz (802.11a+n+ac+ax)</option>
+      </select>
+      <select name="cbid.wireless.wlan10.htbw3">
+        <option value="ht80" selected="selected">80 MHz</option>
+      </select>
+      <select name="cbid.wireless.wlan10.channel4">
+        <option value="36" selected="selected">36 (5180 MHz)</option>
+      </select>
+      <select name="cbid.wireless.wlan10.txpower">
+        <option value="20" selected="selected">Middle</option>
+      </select>
+    </form>
+    """
+
+    parsed = parser_settings.parse_wireless_settings(combo_html, combine_html, uncombine_html)
+
+    assert parsed["smart_connect"]["value"] is False
+    assert parsed["wifi_2g_enabled"]["value"] is True
+    assert parsed["wifi_5g_enabled"]["value"] is False
+    assert parsed["wifi_2g_hidden"]["value"] is True
+    assert parsed["wifi_5g_hidden"]["value"] is False
+    assert parsed["wifi_2g_isolate"]["value"] is False
+    assert parsed["wifi_5g_isolate"]["value"] is True
+    assert parsed["wifi_5g_channel_width"]["value"] == "ht80"
+    assert parsed["wifi_5g_channel"]["value"] == "36"
+
+
+def test_parse_wireless_settings_supports_smart_connect_underscore_fields() -> None:
+    """M3000 smart-connect pages use underscore-suffixed band fields."""
+    combo_html = """
+    <form>
+      <input type="hidden" name="cbid.wireless.smart.connect" value="1" />
+    </form>
+    """
+    combine_html = """
+    <form>
+      <input type="hidden" name="cbid.wireless.wlan.disabled" value="0" />
+      <input type="hidden" name="cbid.wireless.wlan.hidden" value="0" />
+      <input type="hidden" name="cbid.wireless.wlan.isolate" value="0" />
+      <select name="cbid.wireless.wlan.wlan00_hwmode">
+        <option value="11bgnax" selected="selected">2.4GHz (802.11b+g+n+ax)</option>
+      </select>
+      <select name="cbid.wireless.wlan.wlan00_htbw">
+        <option value="auto" selected="selected">Auto</option>
+      </select>
+      <select name="cbid.wireless.wlan.wlan10_hwmode">
+        <option value="11anacax" selected="selected">5GHz (802.11a+n+ac+ax)</option>
+      </select>
+      <select name="cbid.wireless.wlan.wlan10_htbw3">
+        <option value="ht80" selected="selected">80 MHz</option>
+      </select>
+      <select name="cbid.wireless.wlan.wlan10_channel4">
+        <option value="36" selected="selected">36 (5180 MHz)</option>
+      </select>
+      <select name="cbid.wireless.wlan.wlan10_txpower">
+        <option value="100" selected="selected">High</option>
+      </select>
+    </form>
+    """
+
+    parsed = parser_settings.parse_wireless_settings(combo_html, combine_html, "<form></form>")
+
+    assert parsed["smart_connect"]["value"] is True
+    assert parsed["wifi_2g_mode"]["value"] == "11bgnax"
+    assert parsed["wifi_2g_channel_width"]["value"] == "auto"
+    assert parsed["wifi_5g_mode"]["value"] == "11anacax"
+    assert parsed["wifi_5g_channel_width"]["value"] == "ht80"
+    assert parsed["wifi_5g_channel"]["value"] == "36"
+    assert parsed["wifi_5g_tx_power"]["value"] == "100"
+
+
+def test_parse_vpn_and_auto_update_settings_extract_controls() -> None:
+    """VPN and autoupdate pages should expose current switch/select values."""
+    vpn_html = """
+    <form>
+      <input type="hidden" name="cbid.vpn.config.enabled" value="1" />
+      <input type="hidden" name="cbid.vpn.config.s2s" value="1" />
+      <select name="cbid.vpn.config._proto">
+        <option value="pptp" selected="selected">PPTP Client</option>
+      </select>
+      <select name="cbid.vpn.config.filter">
+        <option value="allow" selected="selected">Allow all devices</option>
+      </select>
+      <select name="cbid.vpn.config.access">
+        <option value="wan" selected="selected">Internet</option>
+      </select>
+      <select name="cbid.vpn.config.policy">
+        <option value="killswitch" selected="selected">VPN kill switch</option>
+      </select>
+    </form>
+    """
+    update_html = """
+    <form>
+      <input type="hidden" name="cbid.upgrade.1.auto_upgrade" value="1" />
+      <select name="cbid.upgrade.1.upgrade_time">
+        <option value="0">00:00 - 02:00</option>
+        <option value="3" selected="selected">03:00 - 05:00</option>
+      </select>
+    </form>
+    """
+
+    vpn = parser_settings.parse_vpn_settings(vpn_html)
+    autoupdate = parser_settings.parse_auto_update_settings(update_html)
+
+    assert vpn["enabled"]["value"] is True
+    assert vpn["site_to_site"]["value"] is True
+    assert vpn["protocol"]["value"] == "pptp"
+    assert vpn["default_rule"]["value"] == "allow"
+    assert vpn["client_access"]["value"] == "wan"
+    assert vpn["vpn_policy"]["value"] == "killswitch"
+    assert autoupdate["auto_update"]["value"] is True
+    assert autoupdate["update_time"]["value"] == "3"
+
+
+def test_parse_zerotier_settings_extracts_dedicated_vpn_controls() -> None:
+    """ZeroTier settings should expose canonical VPN switch/select values."""
+    html = """
+    <form>
+      <input type="hidden" name="cbid.zerotier.client.enabled" value="1" />
+      <input type="hidden" name="cbid.zerotier.client.s2s" value="0" />
+      <select name="cbid.zerotier.client.filter">
+        <option value="allow" selected="selected">Allow all devices</option>
+      </select>
+      <select name="cbid.zerotier.client.access">
+        <option value="lanwan" selected="selected">Internet and Local Network</option>
+      </select>
+      <select name="cbid.zerotier.client.policy">
+        <option value="none" selected="selected">Disable</option>
+      </select>
+    </form>
+    """
+
+    parsed = parser_settings.parse_zerotier_settings(html)
+
+    assert parsed["enabled"]["value"] is True
+    assert parsed["site_to_site"]["value"] is False
+    assert parsed["default_rule"]["value"] == "allow"
+    assert parsed["client_access"]["value"] == "lanwan"
+    assert parsed["vpn_policy"]["value"] == "none"
+
+
+def test_parse_wisp_settings_prefers_state_enabled_field() -> None:
+    """WISP settings should read the cbid state field, not only the widget flag."""
+    html = """
+    <form>
+      <input type="hidden" name="cbi.cbe.wds-config.1.enabled" value="1" />
+      <input type="hidden" name="cbid.wds-config.1.enabled" value="0" />
+    </form>
+    """
+
+    parsed = parser_settings.parse_wisp_settings(html)
+
+    assert parsed["enabled"]["value"] is False
+
+
+def test_parse_auto_update_settings_supports_setup_page_field_names() -> None:
+    """Auto-update parsing should accept setup-page field prefixes used by newer R700 firmware."""
+    setup_html = """
+    <form>
+      <input type="hidden" name="cbid.setup.firmware.auto_upgrade" value="0" />
+      <select name="cbid.setup.firmware.upgrade_time">
+        <option value="1">01:00 - 03:00</option>
+        <option value="4" selected="selected">04:00 - 06:00</option>
+      </select>
+    </form>
+    """
+
+    autoupdate = parser_settings.parse_auto_update_settings(setup_html)
+
+    assert autoupdate["auto_update"]["value"] is False
+    assert autoupdate["update_time"]["value"] == "4"
+
+
+def test_parse_lan_and_wan_settings_support_suffix_fallback_keys() -> None:
+    """LAN/WAN setting parsers should accept newer field prefixes when suffixes still match."""
+    lan_html = """
+    <form>
+      <input type="text" name="cbid.setup.lan.ipaddr" value="192.168.10.1" />
+      <select name="cbid.setup.lan.netmask">
+        <option value="255.255.255.0" selected="selected">255.255.255.0</option>
+      </select>
+    </form>
+    """
+    wan_html = """
+    <form>
+      <select name="cbid.setup.wan.proto">
+        <option value="dhcp" selected="selected">DHCP</option>
+      </select>
+      <select name="cbid.setup.wan.netmask">
+        <option value="255.255.255.0" selected="selected">255.255.255.0</option>
+      </select>
+    </form>
+    """
+
+    lan = parser_settings.parse_lan_settings(lan_html)
+    wan = parser_settings.parse_wan_settings(wan_html)
+
+    assert lan["ip_address"]["value"] == "192.168.10.1"
+    assert lan["subnet_mask"]["value"] == "255.255.255.0"
+    assert wan["protocol"]["value"] == "dhcp"
+    assert wan["subnet_mask"]["value"] == "255.255.255.0"

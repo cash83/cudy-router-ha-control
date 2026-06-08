@@ -1,0 +1,733 @@
+"""Router form submission behavior."""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+from urllib.parse import parse_qs
+
+from tests.module_loader import load_cudy_module
+
+
+router_module = load_cudy_module("router")
+
+
+def _response(text: str, status_code: int = 200) -> SimpleNamespace:
+    return SimpleNamespace(text=text, status_code=status_code, ok=(200 <= status_code < 300))
+
+
+def _multipart_payload(files: dict[str, tuple[None, str]]) -> dict[str, str]:
+    """Flatten requests-style multipart tuples for assertions."""
+    return {key: value[1] for key, value in files.items()}
+
+
+def test_submit_form_executes_embedded_apply_workflow(monkeypatch) -> None:
+    """LuCI save/apply responses should trigger the follow-up service restart."""
+    router = router_module.CudyRouter(None, "https://192.168.10.1", "user", "password")
+    monkeypatch.setattr(router_module.time, "time", lambda: 1_700_000_000)
+    monkeypatch.setattr(router_module.time, "sleep", lambda _: None)
+
+    fetched_paths: list[str] = []
+    posted_requests: list[tuple[str, dict[str, list[str]], str]] = []
+
+    form_html = """
+    <form action="/cgi-bin/luci/admin/network/gcom/config/apn">
+      <input type="hidden" name="token" value="page-token" />
+      <input type="hidden" name="timeclock" value="" />
+      <input type="hidden" name="cbi.submit" value="1" />
+      <input type="hidden" name="cbid.network.4g.disabled" value="0" />
+      <button type="submit" name="cbi.apply">Save &amp; Apply</button>
+    </form>
+    """
+    apply_html = """
+    <script type="text/javascript">
+    $.post('/cgi-bin/luci/admin/servicectl/restart/gcom', { token: 'apply-token' },
+        function() {
+            $.get('/cgi-bin/luci/admin/servicectl/status', function(data) {
+                if( data == 'finish' ) {}
+            });
+        }
+    );
+    </script>
+    """
+
+    def fake_get(path: str, **kwargs):
+        fetched_paths.append(path)
+        if path == "admin/network/gcom/config/apn":
+            return _response(form_html)
+        if path == "admin/servicectl/status":
+            return _response("finish")
+        raise AssertionError(f"Unexpected GET path: {path}")
+
+    def fake_post(path: str, **kwargs):
+        payload = parse_qs(kwargs["data"], keep_blank_values=True)
+        posted_requests.append((path, payload, kwargs["headers"]["Referer"]))
+        if path == "admin/network/gcom/config/apn":
+            return _response(apply_html)
+        if path == "admin/servicectl/restart/gcom":
+            return _response("ok")
+        raise AssertionError(f"Unexpected POST path: {path}")
+
+    monkeypatch.setattr(router, "_luci_get", fake_get)
+    monkeypatch.setattr(router, "_luci_post", fake_post)
+
+    result = router._submit_form(
+        "admin/network/gcom/config/apn",
+        {"cbid.network.4g.disabled": "1"},
+        referer="https://192.168.10.1/cgi-bin/luci/admin/network/gcom/config",
+    )
+
+    assert result == (200, "Configuration applied.")
+    assert fetched_paths == [
+        "admin/network/gcom/config/apn",
+        "admin/servicectl/status",
+    ]
+    assert [path for path, _, _ in posted_requests] == [
+        "admin/network/gcom/config/apn",
+        "admin/servicectl/restart/gcom",
+    ]
+
+    form_post = posted_requests[0][1]
+    assert form_post["cbid.network.4g.disabled"] == ["1"]
+    assert form_post["timeclock"] == ["1700000000"]
+    assert form_post["cbi.apply"] == [""]
+
+    apply_post = posted_requests[1][1]
+    assert apply_post == {"token": ["apply-token"]}
+
+
+def test_set_device_access_supports_vpn_toggle(monkeypatch) -> None:
+    """Per-device access toggles should support the VPN control exposed by R700."""
+    router = router_module.CudyRouter(None, "https://192.168.10.1", "user", "password")
+
+    page_html = """
+    <form class="form-horizontal" role="form" method="post">
+      <input type="hidden" name="token" value="page-token" />
+      <table class="table table-striped">
+        <tbody>
+          <tr id="cbi-table-1">
+            <td>NICK</td>
+            <td>192.168.10.20</td>
+            <td>74:86:E2:10:22:61</td>
+            <td>
+              <input type="hidden" name="cbi.cbe.table.1.vpn" value="1" />
+              <input type="hidden" id="cbid.table.1.vpn" name="cbid.table.1.vpn" value="1" />
+              <i class="fa fa-toggle-on" onclick="cbi_switch_toggle(this, true, '/cgi-bin/luci/admin/network/devices/vpn?macaddr=74:86:E2:10:22:61&hostname=NICK&internet=1&vpn=1')"></i>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </form>
+    """
+    posted: list[tuple[str, dict[str, str], dict[str, str]]] = []
+
+    monkeypatch.setattr(
+        router,
+        "get",
+        lambda path, silent=False: page_html if path == "admin/network/devices/devlist?detail=1" else "",
+    )
+
+    def fake_post(path: str, **kwargs):
+        posted.append((path, _multipart_payload(kwargs["files"]), kwargs["headers"]))
+        return _response(
+            page_html.replace('name="cbid.table.1.vpn" value="1"', 'name="cbid.table.1.vpn" value="0"')
+        )
+
+    monkeypatch.setattr(router, "_luci_post", fake_post)
+
+    result = router.set_device_access(
+        {"mac": "74:86:E2:10:22:61"},
+        "vpn",
+        False,
+    )
+
+    assert result[0] == 200
+    assert posted == [
+        (
+            "admin/network/devices/vpn?macaddr=74:86:E2:10:22:61&hostname=NICK&internet=1&vpn=1",
+            {
+                "token": "page-token",
+                "cbi.submit": "1",
+                "cbi.toggle": "1",
+                "cbi.cbe.table.1.vpn": "1",
+                "cbid.table.1.vpn": "0",
+            },
+            {
+                "User-Agent": "Mozilla/5.0",
+                "Referer": "https://192.168.10.1/cgi-bin/luci/admin/network/devices/devlist",
+                "Origin": "https://192.168.10.1",
+                "X-Requested-With": "XMLHttpRequest",
+            },
+        )
+    ]
+
+
+def test_set_device_access_accepts_prefixed_luci_toggle_urls(monkeypatch) -> None:
+    """Toggle URLs may include a path prefix before /cgi-bin/luci/."""
+    router = router_module.CudyRouter(None, "https://192.168.10.1", "user", "password")
+
+    page_html = """
+    <form class="form-horizontal" role="form" method="post"
+          action="/emulator/WR3000/cgi-bin/luci/admin/network/devices/devlist">
+      <input type="hidden" name="token" value="page-token" />
+      <table class="table table-striped">
+        <tbody>
+          <tr id="cbi-table-1">
+            <td>Jack</td>
+            <td>192.168.10.195</td>
+            <td>80:AF:CA:22:14:3C</td>
+            <td>
+              <input type="hidden" name="cbi.cbe.table.1.internet" value="1" />
+              <input type="hidden" id="cbid.table.1.internet" name="cbid.table.1.internet" value="1" />
+              <i class="fa fa-toggle-on" onclick="cbi_switch_toggle(this, true, '/emulator/WR3000/cgi-bin/luci/admin/network/devices/internet?macaddr=80:AF:CA:22:14:3C&hostname=Jack&internet=1&vpn=1&dnsfilter=1')"></i>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </form>
+    """
+    posted: list[tuple[str, dict[str, str]]] = []
+
+    monkeypatch.setattr(
+        router,
+        "get",
+        lambda path, silent=False: page_html if path == "admin/network/devices/devlist?detail=1" else "",
+    )
+
+    def fake_post(path: str, **kwargs):
+        posted.append((path, _multipart_payload(kwargs["files"])))
+        return _response(
+            page_html.replace(
+                'name="cbid.table.1.internet" value="1"',
+                'name="cbid.table.1.internet" value="0"',
+            )
+        )
+
+    monkeypatch.setattr(router, "_luci_post", fake_post)
+
+    result = router.set_device_access(
+        {"mac": "80:AF:CA:22:14:3C"},
+        "internet",
+        False,
+    )
+
+    assert result[0] == 200
+    assert posted == [
+        (
+            "admin/network/devices/internet?macaddr=80:AF:CA:22:14:3C&hostname=Jack&internet=1&vpn=1&dnsfilter=1",
+            {
+                "token": "page-token",
+                "cbi.submit": "1",
+                "cbi.toggle": "1",
+                "cbi.cbe.table.1.internet": "1",
+                "cbid.table.1.internet": "0",
+            },
+        )
+    ]
+
+
+def test_set_device_access_requires_confirmed_dnsfilter_change(monkeypatch) -> None:
+    """A 200 response alone is not enough when the devices page state does not change."""
+    router = router_module.CudyRouter(None, "https://192.168.10.1", "user", "password")
+
+    page_html = """
+    <form class="form-horizontal" role="form" method="post"
+          action="/cgi-bin/luci/admin/network/devices/devlist?detail=1">
+      <input type="hidden" name="token" value="page-token" />
+      <table class="table table-striped">
+        <tbody>
+          <tr id="cbi-table-10">
+            <td>iPhone</td>
+            <td>192.168.10.121</td>
+            <td>2A:3D:68:F8:DC:E9</td>
+            <td>
+              <input type="hidden" name="cbi.cbe.table.10.dnsfilter" value="1" />
+              <input type="hidden" id="cbid.table.10.dnsfilter" name="cbid.table.10.dnsfilter" value="1" />
+              <i class="fa fa-toggle-on" onclick="cbi_switch_toggle(this, true, '/cgi-bin/luci/admin/network/devices/dnsfilter?macaddr=2A:3D:68:F8:DC:E9&hostname=iPhone&internet=1&vpn=1&dnsfilter=1')"></i>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </form>
+    """
+    post_calls: list[str] = []
+
+    monkeypatch.setattr(
+        router,
+        "get",
+        lambda path, silent=False: page_html if path == "admin/network/devices/devlist?detail=1" else "",
+    )
+
+    def fake_post(path: str, **kwargs):
+        post_calls.append(path)
+        return _response(page_html)
+
+    monkeypatch.setattr(router, "_luci_post", fake_post)
+
+    result = router.set_device_access(
+        {"mac": "2A:3D:68:F8:DC:E9"},
+        "dnsfilter",
+        False,
+    )
+
+    assert result == (
+        0,
+        "Device dnsfilter remained 1 after posting to admin/network/devices/devlist?detail=1",
+    )
+    assert post_calls == [
+        "admin/network/devices/dnsfilter?macaddr=2A:3D:68:F8:DC:E9&hostname=iPhone&internet=1&vpn=1&dnsfilter=1",
+        "admin/network/devices/devlist?detail=1",
+    ]
+
+
+def test_set_auto_update_setting_falls_back_to_setup_page(monkeypatch) -> None:
+    """Auto-update writes should target admin/setup when newer firmware exposes the controls there."""
+    router = router_module.CudyRouter(None, "https://192.168.10.1", "user", "password")
+
+    setup_html = """
+    <form action="/cgi-bin/luci/admin/setup">
+      <input type="hidden" name="token" value="page-token" />
+      <input type="hidden" name="timeclock" value="" />
+      <input type="hidden" name="cbi.submit" value="1" />
+      <input type="hidden" name="cbid.setup.firmware.auto_upgrade" value="0" />
+      <select name="cbid.setup.firmware.upgrade_time">
+        <option value="1">01:00 - 03:00</option>
+        <option value="4" selected="selected">04:00 - 06:00</option>
+      </select>
+      <button type="submit" name="cbi.apply">Save &amp; Apply</button>
+    </form>
+    """
+
+    posted: list[tuple[str, dict[str, list[str]], str]] = []
+
+    monkeypatch.setattr(router, "get", lambda path, silent=False: setup_html if path == "admin/setup" else "")
+
+    def fake_get(path: str, **kwargs):
+        if path == "admin/setup":
+            return _response(setup_html)
+        raise AssertionError(f"Unexpected GET path: {path}")
+
+    def fake_post(path: str, **kwargs):
+        posted.append((path, parse_qs(kwargs["data"], keep_blank_values=True), kwargs["headers"]["Referer"]))
+        return _response("saved")
+
+    monkeypatch.setattr(router, "_luci_get", fake_get)
+    monkeypatch.setattr(router, "_luci_post", fake_post)
+
+    result = router.set_auto_update_setting("auto_update", True)
+
+    assert result == (200, "saved")
+    assert posted == [
+        (
+            "admin/setup",
+            {
+                "token": ["page-token"],
+                "timeclock": [posted[0][1]["timeclock"][0]],
+                "cbi.submit": ["1"],
+                "cbid.setup.firmware.auto_upgrade": ["1"],
+                "cbid.setup.firmware.upgrade_time": ["4"],
+                "cbi.apply": [""],
+            },
+            "https://192.168.10.1/cgi-bin/luci/admin/setup",
+        )
+    ]
+
+
+def test_set_wisp_setting_prefers_real_enabled_field(monkeypatch) -> None:
+    """WISP writes should update the cbid state field, not the visible toggle helper."""
+    router = router_module.CudyRouter(None, "https://192.168.10.1", "user", "password")
+
+    wisp_html = """
+    <form action="/cgi-bin/luci/admin/network/wireless/wds/config/nomodal/wisp">
+      <input type="hidden" name="token" value="page-token" />
+      <input type="hidden" name="timeclock" value="" />
+      <input type="hidden" name="cbi.submit" value="1" />
+      <input type="hidden" name="cbi.cbe.wds-config.1.enabled" value="1" />
+      <input type="hidden" name="cbid.wds-config.1.enabled" value="1" />
+      <button type="submit" name="cbi.apply">Save &amp; Apply</button>
+    </form>
+    """
+
+    posted: list[tuple[str, dict[str, list[str]], str]] = []
+
+    monkeypatch.setattr(
+        router,
+        "get",
+        lambda path, silent=False: wisp_html
+        if path == "admin/network/wireless/wds/config/nomodal/wisp"
+        else "",
+    )
+
+    def fake_get(path: str, **kwargs):
+        if path == "admin/network/wireless/wds/config/nomodal/wisp":
+            return _response(wisp_html)
+        if path == "admin/servicectl/status":
+            return _response("finish")
+        raise AssertionError(f"Unexpected GET path: {path}")
+
+    def fake_post(path: str, **kwargs):
+        posted.append((path, parse_qs(kwargs["data"], keep_blank_values=True), kwargs["headers"]["Referer"]))
+        return _response("saved")
+
+    monkeypatch.setattr(router, "_luci_get", fake_get)
+    monkeypatch.setattr(router, "_luci_post", fake_post)
+
+    result = router.set_wisp_setting("enabled", False)
+
+    assert result == (200, "Configuration applied.")
+    assert posted == [
+        (
+            "admin/network/wireless/wds/config/nomodal/wisp",
+            {
+                "token": ["page-token"],
+                "timeclock": [posted[0][1]["timeclock"][0]],
+                "cbi.submit": ["1"],
+                "cbi.cbe.wds-config.1.enabled": ["1"],
+                "cbid.wds-config.1.enabled": ["0"],
+                "cbi.apply": [""],
+            },
+            "https://192.168.10.1/cgi-bin/luci/admin/network/wireless/wds",
+        ),
+        (
+            "admin/servicectl/restart/wireless,vlan",
+            {
+                "token": ["page-token"],
+            },
+            "https://192.168.10.1/cgi-bin/luci/admin/network/wireless/wds",
+        ),
+    ]
+
+
+def test_set_wireless_setting_uses_present_5g_channel_width_field(monkeypatch) -> None:
+    """5 GHz selects should write the field variant present on the active form."""
+    router = router_module.CudyRouter(None, "https://192.168.10.1", "user", "password")
+
+    combo_html = """
+    <form>
+      <input type="hidden" name="cbid.wireless.smart.connect" value="0" />
+    </form>
+    """
+    uncombine_html = """
+    <form action="/cgi-bin/luci/admin/network/wireless/config/uncombine">
+      <input type="hidden" name="token" value="page-token" />
+      <input type="hidden" name="timeclock" value="" />
+      <input type="hidden" name="cbi.submit" value="1" />
+      <select name="cbid.wireless.wlan10.htbw3">
+        <option value="ht40" selected="selected">40 MHz</option>
+        <option value="ht80">80 MHz</option>
+      </select>
+      <button type="submit" name="cbi.apply">Save &amp; Apply</button>
+    </form>
+    """
+
+    posted: list[tuple[str, dict[str, list[str]], str]] = []
+
+    monkeypatch.setattr(
+        router,
+        "get",
+        lambda path, silent=False: combo_html
+        if path == "admin/network/wireless/config/combo"
+        else "",
+    )
+
+    def fake_get(path: str, **kwargs):
+        if path == "admin/network/wireless/config/uncombine":
+            return _response(uncombine_html)
+        if path == "admin/servicectl/status":
+            return _response("finish")
+        raise AssertionError(f"Unexpected GET path: {path}")
+
+    def fake_post(path: str, **kwargs):
+        posted.append((path, parse_qs(kwargs["data"], keep_blank_values=True), kwargs["headers"]["Referer"]))
+        return _response("saved")
+
+    monkeypatch.setattr(router, "_luci_get", fake_get)
+    monkeypatch.setattr(router, "_luci_post", fake_post)
+
+    result = router.set_wireless_setting("wifi_5g_channel_width", "ht80")
+
+    assert result == (200, "Configuration applied.")
+    assert posted[0] == (
+        "admin/network/wireless/config/uncombine",
+        {
+            "token": ["page-token"],
+            "timeclock": [posted[0][1]["timeclock"][0]],
+            "cbi.submit": ["1"],
+            "cbid.wireless.wlan10.htbw3": ["ht80"],
+            "cbi.apply": [""],
+        },
+        "https://192.168.10.1/cgi-bin/luci/admin/network/wireless/config",
+    )
+    assert posted[1] == (
+        "admin/servicectl/restart/wireless,vlan",
+        {
+            "token": ["page-token"],
+        },
+        "https://192.168.10.1/cgi-bin/luci/admin/network/wireless/config",
+    )
+
+
+def test_set_wireless_setting_supports_p4_base_5g_channel_width_field(monkeypatch) -> None:
+    """P4 firmware exposes the 5 GHz channel width as wlan10.htbw."""
+    router = router_module.CudyRouter(None, "https://192.168.1.1", "user", "password")
+
+    combo_html = """
+    <form>
+      <input type="hidden" name="cbid.wireless.smart.connect" value="0" />
+    </form>
+    """
+    uncombine_html = """
+    <form action="/cgi-bin/luci/admin/network/wireless/config/uncombine">
+      <input type="hidden" name="token" value="page-token" />
+      <input type="hidden" name="timeclock" value="" />
+      <input type="hidden" name="cbi.submit" value="1" />
+      <select name="cbid.wireless.wlan10.htbw">
+        <option value="auto" selected="selected">Auto</option>
+        <option value="ht80">80 MHz</option>
+      </select>
+      <button type="submit" name="cbi.apply">Save &amp; Apply</button>
+    </form>
+    """
+
+    posted: list[tuple[str, dict[str, list[str]], str]] = []
+
+    monkeypatch.setattr(
+        router,
+        "get",
+        lambda path, silent=False: combo_html
+        if path == "admin/network/wireless/config/combo"
+        else "",
+    )
+
+    def fake_get(path: str, **kwargs):
+        if path == "admin/network/wireless/config/uncombine":
+            return _response(uncombine_html)
+        if path == "admin/servicectl/status":
+            return _response("finish")
+        raise AssertionError(f"Unexpected GET path: {path}")
+
+    def fake_post(path: str, **kwargs):
+        posted.append((path, parse_qs(kwargs["data"], keep_blank_values=True), kwargs["headers"]["Referer"]))
+        return _response("saved")
+
+    monkeypatch.setattr(router, "_luci_get", fake_get)
+    monkeypatch.setattr(router, "_luci_post", fake_post)
+
+    result = router.set_wireless_setting("wifi_5g_channel_width", "ht80")
+
+    assert result == (200, "Configuration applied.")
+    assert posted[0][1]["cbid.wireless.wlan10.htbw"] == ["ht80"]
+
+
+def test_set_wireless_setting_supports_smart_connect_underscore_fields(monkeypatch) -> None:
+    """Smart-connect writes should target underscore field names used by M3000."""
+    router = router_module.CudyRouter(None, "https://192.168.10.1", "user", "password")
+
+    combo_html = """
+    <form>
+      <input type="hidden" name="cbid.wireless.smart.connect" value="1" />
+    </form>
+    """
+    combine_html = """
+    <form action="/cgi-bin/luci/admin/network/wireless/config/combine">
+      <input type="hidden" name="token" value="page-token" />
+      <input type="hidden" name="timeclock" value="" />
+      <input type="hidden" name="cbi.submit" value="1" />
+      <select name="cbid.wireless.wlan.wlan10_htbw1">
+        <option value="auto" selected="selected">Auto</option>
+        <option value="ht40">40 MHz</option>
+      </select>
+      <select name="cbid.wireless.wlan.wlan10_htbw3">
+        <option value="auto" selected="selected">Auto</option>
+        <option value="ht80">80 MHz</option>
+      </select>
+      <button type="submit" name="cbi.apply">Save &amp; Apply</button>
+    </form>
+    """
+
+    posted: list[tuple[str, dict[str, list[str]], str]] = []
+
+    monkeypatch.setattr(
+        router,
+        "get",
+        lambda path, silent=False: combo_html
+        if path == "admin/network/wireless/config/combo"
+        else "",
+    )
+
+    def fake_get(path: str, **kwargs):
+        if path == "admin/network/wireless/config/combine":
+            return _response(combine_html)
+        if path == "admin/servicectl/status":
+            return _response("finish")
+        raise AssertionError(f"Unexpected GET path: {path}")
+
+    def fake_post(path: str, **kwargs):
+        posted.append((path, parse_qs(kwargs["data"], keep_blank_values=True), kwargs["headers"]["Referer"]))
+        return _response("saved")
+
+    monkeypatch.setattr(router, "_luci_get", fake_get)
+    monkeypatch.setattr(router, "_luci_post", fake_post)
+
+    result = router.set_wireless_setting("wifi_5g_channel_width", "ht80")
+
+    assert result == (200, "Configuration applied.")
+    assert posted[0][0] == "admin/network/wireless/config/combine"
+    assert posted[0][1]["cbid.wireless.wlan.wlan10_htbw3"] == ["ht80"]
+    assert posted[0][1]["cbid.wireless.wlan.wlan10_htbw1"] == ["auto"]
+
+
+def test_set_vpn_setting_uses_zerotier_page_when_protocol_is_zerotier(monkeypatch) -> None:
+    """ZeroTier VPN toggles should update the dedicated ZeroTier form."""
+    router = router_module.CudyRouter(None, "https://192.168.10.1", "user", "password")
+
+    vpn_config_html = """
+    <form action="/cgi-bin/luci/admin/network/vpn/config">
+      <input type="hidden" name="token" value="generic-token" />
+      <input type="hidden" name="timeclock" value="" />
+      <input type="hidden" name="cbi.submit" value="1" />
+      <input type="hidden" name="cbi.cbe.vpn.config.enabled" value="1" />
+      <input type="hidden" name="cbid.vpn.config.enabled" value="1" />
+      <select name="cbid.vpn.config._proto">
+        <option value="zerotiers" selected="selected">ZeroTier Master</option>
+      </select>
+      <button type="submit" name="cbi.apply">Save &amp; Apply</button>
+    </form>
+    """
+    zerotier_html = """
+    <form action="/cgi-bin/luci/admin/network/vpn/zerotier?embedded=&mvpn=">
+      <input type="hidden" name="token" value="page-token" />
+      <input type="hidden" name="timeclock" value="" />
+      <input type="hidden" name="cbi.submit" value="1" />
+      <input type="hidden" name="cbi.cbe.zerotier.client.enabled" value="1" />
+      <input type="hidden" name="cbid.zerotier.client.enabled" value="1" />
+      <button type="submit" name="cbi.apply">Save &amp; Apply</button>
+    </form>
+    """
+
+    posted: list[tuple[str, dict[str, list[str]], str]] = []
+
+    monkeypatch.setattr(
+        router,
+        "get",
+        lambda path, silent=False: vpn_config_html
+        if path == "admin/network/vpn/config"
+        else zerotier_html
+        if path == "admin/network/vpn/zerotier?embedded=&mvpn="
+        else "",
+    )
+
+    def fake_get(path: str, **kwargs):
+        if path == "admin/network/vpn/config":
+            return _response(vpn_config_html)
+        if path == "admin/network/vpn/zerotier?embedded=&mvpn=":
+            return _response(zerotier_html)
+        if path == "admin/servicectl/status":
+            return _response("finish")
+        raise AssertionError(f"Unexpected GET path: {path}")
+
+    def fake_post(path: str, **kwargs):
+        posted.append((path, parse_qs(kwargs["data"], keep_blank_values=True), kwargs["headers"]["Referer"]))
+        return _response("saved")
+
+    monkeypatch.setattr(router, "_luci_get", fake_get)
+    monkeypatch.setattr(router, "_luci_post", fake_post)
+
+    result = router.set_vpn_setting("enabled", False)
+
+    assert result == (200, "Configuration applied.")
+    assert posted[0] == (
+        "admin/network/vpn/config",
+        {
+            "token": ["generic-token"],
+            "timeclock": [posted[0][1]["timeclock"][0]],
+            "cbi.submit": ["1"],
+            "cbi.cbe.vpn.config.enabled": ["1"],
+            "cbid.vpn.config.enabled": ["0"],
+            "cbid.vpn.config._proto": ["zerotiers"],
+            "cbi.apply": [""],
+        },
+        "https://192.168.10.1/cgi-bin/luci/admin/network/vpn/config",
+    )
+    assert posted[1] == (
+        "admin/network/vpn/zerotier?embedded=&mvpn=",
+        {
+            "token": ["page-token"],
+            "timeclock": [posted[1][1]["timeclock"][0]],
+            "cbi.submit": ["1"],
+            "cbi.cbe.zerotier.client.enabled": ["1"],
+            "cbid.zerotier.client.enabled": ["0"],
+            "cbi.apply": [""],
+        },
+        "https://192.168.10.1/cgi-bin/luci/admin/network/vpn/zerotier",
+    )
+    assert posted[2] == (
+        "admin/servicectl/restart/zerotier,firewall",
+        {
+            "token": ["page-token"],
+        },
+        "https://192.168.10.1/cgi-bin/luci/admin/network/vpn/zerotier",
+    )
+
+
+def test_set_vpn_setting_falls_back_to_generic_zerotier_fields(monkeypatch) -> None:
+    """P4 keeps ZeroTier enabled/default fields on the generic VPN form."""
+    router = router_module.CudyRouter(None, "https://192.168.1.1", "user", "password")
+
+    vpn_config_html = """
+    <form action="/cgi-bin/luci/admin/network/vpn/config">
+      <input type="hidden" name="token" value="page-token" />
+      <input type="hidden" name="timeclock" value="" />
+      <input type="hidden" name="cbi.submit" value="1" />
+      <input type="hidden" name="cbi.cbe.vpn.config.enabled" value="1" />
+      <input type="hidden" name="cbid.vpn.config.enabled" value="1" />
+      <select name="cbid.vpn.config._proto">
+        <option value="zerotiers" selected="selected">ZeroTier Master</option>
+      </select>
+      <button type="submit" name="cbi.apply">Save &amp; Apply</button>
+    </form>
+    """
+    zerotier_html = """
+    <form action="/cgi-bin/luci/admin/network/vpn/zerotier?embedded=&mvpn=">
+      <input type="hidden" name="token" value="page-token" />
+      <input type="text" name="cbid.zerotier.client.join" value="network-id" />
+    </form>
+    """
+
+    posted: list[tuple[str, dict[str, list[str]], str]] = []
+
+    monkeypatch.setattr(
+        router,
+        "get",
+        lambda path, silent=False: vpn_config_html
+        if path == "admin/network/vpn/config"
+        else zerotier_html
+        if path == "admin/network/vpn/zerotier?embedded=&mvpn="
+        else "",
+    )
+
+    def fake_get(path: str, **kwargs):
+        if path == "admin/network/vpn/config":
+            return _response(vpn_config_html)
+        if path == "admin/servicectl/status":
+            return _response("finish")
+        raise AssertionError(f"Unexpected GET path: {path}")
+
+    def fake_post(path: str, **kwargs):
+        posted.append((path, parse_qs(kwargs["data"], keep_blank_values=True), kwargs["headers"]["Referer"]))
+        return _response("saved")
+
+    monkeypatch.setattr(router, "_luci_get", fake_get)
+    monkeypatch.setattr(router, "_luci_post", fake_post)
+
+    result = router.set_vpn_setting("enabled", False)
+
+    assert result == (200, "Configuration applied.")
+    assert posted[0][0] == "admin/network/vpn/config"
+    assert posted[0][1]["cbid.vpn.config.enabled"] == ["0"]
+    assert posted[1] == (
+        "admin/servicectl/restart/zerotier,firewall",
+        {
+            "token": ["page-token"],
+        },
+        "https://192.168.1.1/cgi-bin/luci/admin/network/vpn/config",
+    )
