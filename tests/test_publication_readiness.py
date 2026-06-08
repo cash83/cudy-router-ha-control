@@ -14,6 +14,8 @@ TRANSLATIONS_PATH = ROOT / "custom_components" / "cudy_router" / "translations" 
 README_PATH = ROOT / "README.md"
 BRAND_ICON_PATH = ROOT / "custom_components" / "cudy_router" / "brand" / "icon.png"
 BRAND_LOGO_PATH = ROOT / "custom_components" / "cudy_router" / "brand" / "logo.png"
+ROOT_BRAND_ICON_PATH = ROOT / "brand" / "icon.png"
+ROOT_BRAND_LOGO_PATH = ROOT / "brand" / "logo.png"
 HACS_WORKFLOW_PATH = ROOT / ".github" / "workflows" / "validate.yaml"
 HASSFEST_WORKFLOW_PATH = ROOT / ".github" / "workflows" / "hassfest.yaml"
 RELEASE_WORKFLOW_PATH = ROOT / ".github" / "workflows" / "release.yaml"
@@ -131,3 +133,5 @@ def test_local_brand_assets_exist() -> None:
     """The integration should ship local brand assets for Home Assistant."""
     assert BRAND_ICON_PATH.is_file()
     assert BRAND_LOGO_PATH.is_file()
+    assert ROOT_BRAND_ICON_PATH.is_file()
+    assert ROOT_BRAND_LOGO_PATH.is_file()
