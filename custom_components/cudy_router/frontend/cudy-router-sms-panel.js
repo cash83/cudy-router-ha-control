@@ -22,13 +22,17 @@ class CudyRouterSmsPanel extends HTMLElement {
   }
 
   set hass(hass) {
+    const previousDarkMode = Boolean(this._hass?.themes?.darkMode);
     const firstLoad = !this._hass;
+    const currentDarkMode = Boolean(hass?.themes?.darkMode);
     this._hass = hass;
     if (firstLoad && !this._bootstrapped) {
       this._bootstrapped = true;
       this._loadEntries();
     }
-    this._render();
+    if (firstLoad || previousDarkMode !== currentDarkMode) {
+      this._render();
+    }
   }
 
   set panel(panel) {
@@ -168,10 +172,11 @@ class CudyRouterSmsPanel extends HTMLElement {
         phone_number: this._composePhone.trim(),
         message: this._composeMessage,
       });
-      this._notice = result.message || "SMS sent.";
+      const notice = result.message || "Router accepted the SMS request. Delivery is not confirmed.";
       this._composeMessage = "";
       await this._loadMessages();
       await this._loadEntries(true);
+      this._notice = notice;
     } catch (err) {
       this._error = err?.message || "Failed to send SMS.";
     } finally {
@@ -227,7 +232,7 @@ class CudyRouterSmsPanel extends HTMLElement {
         const activeClass = key === this._selectedMessageKey ? "message-item active" : "message-item";
         const status = this._selectedTab === "inbox"
           ? `<span class="chip ${message.read ? "muted" : "unread"}">${message.read ? "Read" : "Unread"}</span>`
-          : `<span class="chip muted">Sent</span>`;
+          : `<span class="chip muted">Outbox</span>`;
         return `
           <button class="${activeClass}" data-message-key="${this._escapeHtml(key)}">
             <div class="message-row">
@@ -273,6 +278,8 @@ class CudyRouterSmsPanel extends HTMLElement {
   }
 
   _render() {
+    const previousScrollRoot = this.shadowRoot.querySelector(".scroll-root");
+    const scrollTop = previousScrollRoot ? previousScrollRoot.scrollTop : 0;
     const selectedEntry = this._entries.find((entry) => entry.entry_id === this._selectedEntryId) || null;
     const counts = this._data?.counts || selectedEntry?.counts || { inbox: 0, outbox: 0, unread: 0 };
     const loading = this._entriesLoading || this._messagesLoading;
@@ -358,13 +365,10 @@ class CudyRouterSmsPanel extends HTMLElement {
           --sms-panel-error: ${theme.error};
           --sms-panel-radius: var(--ha-card-border-radius, 16px);
           display: block;
-          min-height: 100%;
+          height: 100vh;
+          min-height: 0;
           box-sizing: border-box;
-          background:
-            radial-gradient(circle at top left, var(--sms-panel-accent-soft), transparent 28%),
-            var(--sms-panel-page-background);
           color: var(--sms-panel-text);
-          padding: 24px;
           font-family: var(--sms-panel-font-family);
           font-size: 16px;
           line-height: 1.5;
@@ -375,6 +379,21 @@ class CudyRouterSmsPanel extends HTMLElement {
         * {
           box-sizing: border-box;
           font-family: inherit;
+        }
+
+        .scroll-root {
+          height: 100%;
+          overflow-y: auto;
+          overscroll-behavior-y: contain;
+          padding: 24px;
+          background:
+            radial-gradient(circle at top left, var(--sms-panel-accent-soft), transparent 28%),
+            var(--sms-panel-page-background);
+          -webkit-overflow-scrolling: touch;
+        }
+
+        .scroll-root:focus {
+          outline: none;
         }
 
         .shell {
@@ -757,8 +776,6 @@ class CudyRouterSmsPanel extends HTMLElement {
           gap: 10px;
           align-content: start;
           align-items: start;
-          max-height: 560px;
-          overflow: auto;
           padding-right: 4px;
           min-height: 0;
         }
@@ -932,7 +949,7 @@ class CudyRouterSmsPanel extends HTMLElement {
         }
 
         @media (max-width: 980px) {
-          :host {
+          .scroll-root {
             padding: 16px;
           }
 
@@ -952,6 +969,7 @@ class CudyRouterSmsPanel extends HTMLElement {
           }
         }
       </style>
+      <div class="scroll-root" tabindex="0">
       <div class="shell">
         <section class="hero">
           <div class="hero-top">
@@ -1065,6 +1083,7 @@ class CudyRouterSmsPanel extends HTMLElement {
           </div>
         </section>
       </div>
+      </div>
     `;
 
     this.shadowRoot.querySelector("#refresh-button")?.addEventListener("click", () => {
@@ -1103,7 +1122,14 @@ class CudyRouterSmsPanel extends HTMLElement {
     this.shadowRoot.querySelector("#send-button")?.addEventListener("click", () => {
       this._sendSms();
     });
+
+    const scrollRoot = this.shadowRoot.querySelector(".scroll-root");
+    if (scrollRoot) {
+      scrollRoot.scrollTop = scrollTop;
+    }
   }
 }
 
-customElements.define("cudy-router-sms-panel", CudyRouterSmsPanel);
+if (!customElements.get("cudy-router-sms-panel")) {
+  customElements.define("cudy-router-sms-panel", CudyRouterSmsPanel);
+}

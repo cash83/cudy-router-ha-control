@@ -153,17 +153,31 @@ def interpret_send_sms_result(status_code: int, response_text: str) -> dict[str,
     """Normalize the router's send-SMS response."""
     snippet = (response_text or "").strip()
     normalized = snippet.lower()
-    success = (
-        200 <= status_code < 400
-        and "error" not in normalized
-        and "failed" not in normalized
+    failure_markers = (
+        "send failed",
+        "failed to send",
+        "sms failed",
+        "error sending",
+        "invalid phone",
+        "invalid number",
+        "forbidden",
+        "unauthorized",
+        "login required",
+        "please login",
+        "csrf",
+        "invalid token",
+        "no token",
+        "insufficient",
+        "not enough",
+    )
+    success = 200 <= status_code < 400 and not any(
+        marker in normalized for marker in failure_markers
     )
 
-    message = snippet or (
-        "SMS sent."
-        if success
-        else "The router did not confirm the SMS send request."
-    )
+    if success:
+        message = "Router accepted the SMS request and refreshed Outbox. Delivery is not confirmed by the router."
+    else:
+        message = snippet or "The router did not accept the SMS send request."
 
     return {
         "success": success,
