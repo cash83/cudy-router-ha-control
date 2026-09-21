@@ -328,3 +328,29 @@ def test_debug_payload_can_skip_live_endpoint_probes_for_fast_diagnostics() -> N
     assert payload["diagnostics"]["full_probe_report_action"] == "cudy_router.generate_debug_report"
     assert payload["coordinator"]["data"]["modem"]["signal"]["value"] == 2
     assert payload["probes"]["modem"] == []
+
+
+def test_mesh_clients_summary_reports_telemetry_and_raw_field_names() -> None:
+    """The mesh clients endpoint is JSON, and the report must not parse it as HTML."""
+    from pathlib import Path
+
+    payload = (
+        Path(__file__).resolve().parent / "fixtures" / "mesh" / "mesh_clients.json"
+    ).read_text(encoding="utf-8")
+
+    summary = debug_report._mesh_clients_summary(payload)
+
+    assert summary["node_count"] == 3
+    satellite = summary["nodes"][1]
+    assert satellite["state"] == "connected"
+    assert satellite["telemetry"]["backhaul_signal"] == -58
+    # Raw field names let an unsupported model be diagnosed from the report.
+    assert "rssireal" in satellite["station_fields"]
+    assert "backhaul" in satellite["sysreport_fields"]
+    assert "devcnt" in satellite["reported_fields"]
+
+
+def test_mesh_clients_summary_survives_a_non_json_body() -> None:
+    """Firmware that answers with an HTML page must not raise."""
+    assert debug_report._mesh_clients_summary("<html>login</html>") == {}
+    assert debug_report._mesh_clients_summary("[not json]") == {}

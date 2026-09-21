@@ -144,10 +144,16 @@ def test_async_send_sms_message_refreshes_on_success() -> None:
         )
     )
 
+    # The router answers "Queued successfully" as soon as it accepts the
+    # request, which says nothing about delivery, so its wording is replaced
+    # rather than passed through to the user.
     assert result == {
         "success": True,
         "status_code": 200,
-        "message": "Queued successfully",
+        "message": (
+            "Router accepted the SMS request and refreshed Outbox. "
+            "Delivery is not confirmed by the router."
+        ),
     }
     assert coordinator.refresh_calls == 1
 

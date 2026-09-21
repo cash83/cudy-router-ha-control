@@ -447,7 +447,7 @@ class CudyClientFeatureSwitch(
         self._attr_unique_id = (
             f"{config_entry.entry_id}-device-{self._normalized_mac}-{feature_key}"
         )
-        self._attr_device_info = build_client_device_info(config_entry, device)
+        self._attr_device_info = build_client_device_info(coordinator.hass, config_entry, device)
         self._optimistic_value: bool | None = None
 
     def _current_device(self) -> dict[str, Any]:
@@ -634,6 +634,7 @@ class CudyMeshLEDSwitch(
             f"{coordinator.config_entry.entry_id}-mesh-{mesh_mac}-led"
         )
         self._attr_device_info = build_mesh_device_info(
+            coordinator.hass,
             coordinator,
             mesh_mac,
             mesh_device,

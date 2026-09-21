@@ -125,6 +125,7 @@ class CudyMeshRebootButton(
             f"{coordinator.config_entry.entry_id}-mesh-{mesh_mac}-reboot"
         )
         self._attr_device_info = build_mesh_device_info(
+            coordinator.hass,
             coordinator,
             mesh_mac,
             mesh_device,

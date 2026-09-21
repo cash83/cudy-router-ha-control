@@ -13,6 +13,7 @@ from typing import Any
 from .bs4_compat import BeautifulSoup
 from .const import DOMAIN
 from .entity_catalog import build_entity_catalog
+from .mesh import node_telemetry
 from .parser import (
     parse_data_usage,
     parse_devices,
@@ -484,6 +485,44 @@ def _redacted_table_data(html: str, redactor: Redactor) -> dict[str, Any]:
     }
 
 
+def _mesh_clients_summary(payload: str) -> dict[str, Any]:
+    """Summarise the mesh clients JSON endpoint for the debug report.
+
+    Reports what the integration reads per node plus the raw field names the
+    node offered, so an unsupported model can be diagnosed without asking the
+    reporter to dump the endpoint by hand.
+    """
+    match = re.search(r"\[.*\]", payload, re.DOTALL)
+    if not match:
+        return {}
+    try:
+        clients = json.loads(match.group(0))
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    if not isinstance(clients, list):
+        return {}
+
+    nodes: list[dict[str, Any]] = []
+    for client in clients:
+        if not isinstance(client, dict):
+            continue
+        sysreport = client.get("sysreport")
+        sysreport = sysreport if isinstance(sysreport, dict) else {}
+        stations = sysreport.get("sta")
+        stations = [station for station in stations if isinstance(station, dict)] if isinstance(stations, list) else []
+        nodes.append(
+            {
+                "id": client.get("id"),
+                "state": client.get("state"),
+                "telemetry": node_telemetry(client),
+                "reported_fields": sorted(client),
+                "sysreport_fields": sorted(sysreport),
+                "station_fields": sorted({key for station in stations for key in station}),
+            }
+        )
+    return {"node_count": len(nodes), "nodes": nodes}
+
+
 def _parser_output(path: str, html: str, redactor: Redactor) -> dict[str, Any]:
     """Return redacted parser output for a probed endpoint."""
     if not html:
@@ -516,6 +555,10 @@ def _parser_output(path: str, html: str, redactor: Redactor) -> dict[str, Any]:
             return redactor.data(parse_lan_settings(html))
         if path == "admin/services/dhcp/status?detail=1":
             return redactor.data(parse_dhcp_status(html))
+        if path.startswith("admin/network/mesh/clients"):
+            # This endpoint answers with JSON, not HTML, and carries the
+            # backhaul and load fields the mesh sensors are built from.
+            return redactor.data(_mesh_clients_summary(html))
         if path.startswith("admin/network/mesh") or path.startswith("admin/easymesh"):
             return redactor.data(parse_mesh_devices(html))
         if path == "admin/network/gcom/config/apn":

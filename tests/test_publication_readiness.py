@@ -37,7 +37,7 @@ def test_manifest_has_required_hacs_fields() -> None:
         "beautifulsoup4==4.14.3",
         "python-dateutil==2.9.0.post0",
     ]
-    assert manifest["version"] == "1.3.35"
+    assert manifest["version"] == "1.4.0"
     assert "image" not in manifest
 
 
@@ -46,8 +46,10 @@ def test_hacs_json_matches_current_schema() -> None:
     hacs_json = json.loads(HACS_JSON_PATH.read_text(encoding="utf-8"))
 
     assert hacs_json["name"] == "Cudy Router"
-    assert hacs_json["zip_release"] is False
-    assert set(hacs_json) == {"name", "zip_release"}
+    # zip_release was dropped on purpose: releases ship the repository files,
+    # which is what HACS does by default, so declaring it added nothing.
+    assert "zip_release" not in hacs_json
+    assert set(hacs_json) == {"name"}
 
 
 def test_config_flow_strings_cover_reauth_flow() -> None:

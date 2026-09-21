@@ -249,9 +249,29 @@ def _ensure_homeassistant_stub() -> None:
             def async_remove_device(self, device_id: str) -> None:
                 self.devices.pop(device_id, None)
 
+            def async_get(self, device_id: str):
+                return self.devices.get(device_id)
+
+            def async_get_device_by_identifier(self, identifier, config_entry_id):
+                for device in self.devices.values():
+                    if identifier in getattr(device, "identifiers", set()) and (
+                        config_entry_id in getattr(device, "config_entries", set())
+                    ):
+                        return device
+                return None
+
+        def _async_entries_for_config_entry(registry, config_entry_id):
+            """Mirror HA's helper over the lightweight registry doubles."""
+            return [
+                device
+                for device in list(getattr(registry, "devices", {}).values())
+                if config_entry_id in getattr(device, "config_entries", set())
+            ]
+
         device_registry_module.CONNECTION_NETWORK_MAC = "mac"
         device_registry_module.DeviceInfo = DeviceInfo
         device_registry_module._registry = _DeviceRegistry()
+        device_registry_module.async_entries_for_config_entry = _async_entries_for_config_entry
         device_registry_module.async_get = lambda hass: device_registry_module._registry
         sys.modules["homeassistant.helpers.device_registry"] = device_registry_module
 

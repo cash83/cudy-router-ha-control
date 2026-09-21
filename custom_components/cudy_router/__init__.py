@@ -26,6 +26,7 @@ from homeassistant.exceptions import (
     HomeAssistantError,
 )
 from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.device_registry import DeviceEntry
 
 from .const import (
     DOMAIN,
@@ -40,7 +41,9 @@ from .coordinator import CudyRouterDataUpdateCoordinator
 from .device_info import (
     async_cleanup_stale_client_entities,
     async_cleanup_stale_tracker_entities,
+    async_register_router_device,
     known_client_devices,
+    reported_device_identifiers,
     known_tracker_clients,
 )
 from .debug_report import async_generate_debug_report, log_debug_report
@@ -217,6 +220,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: CudyRouterConfigEntry) -
 
     entry.runtime_data = coordinator
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
+
+    # Clients and mesh nodes are attached to the router with via_device_id,
+    # which needs the router's registry id, so it has to exist before the
+    # platforms start building their entities.
+    async_register_router_device(hass, coordinator)
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
@@ -453,6 +461,27 @@ async def _async_setup_services(hass: HomeAssistant) -> None:
         handle_generate_debug_report,
         SERVICE_GENERATE_DEBUG_REPORT_SCHEMA,
         supports_response=SupportsResponse.ONLY if SupportsResponse is not None else None,
+    )
+
+
+async def async_remove_config_entry_device(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    device_entry: DeviceEntry,
+) -> bool:
+    """Allow deleting a device the router no longer reports.
+
+    Without this hook Home Assistant refuses every deletion, so a mesh node or
+    client that disappears for good can never be cleared from the registry.
+    The router's own device always stays: removing the integration is what
+    removes that one.
+    """
+    coordinator = hass.data.get(DOMAIN, {}).get(entry.entry_id)
+    reported = reported_device_identifiers(entry.entry_id, getattr(coordinator, "data", None))
+
+    return not any(
+        domain == DOMAIN and identifier in reported
+        for domain, identifier in device_entry.identifiers
     )
 
 

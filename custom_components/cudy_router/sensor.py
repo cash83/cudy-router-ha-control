@@ -50,7 +50,10 @@ from .sensor_descriptions import (
     DEVICE_IP_SENSOR,
     DEVICE_ONLINE_TIME_SENSOR,
     DEVICE_SIGNAL_DETAILS_SENSOR,
+    MESH_DEVICE_BACKHAUL_RX_RATE_SENSOR,
     MESH_DEVICE_BACKHAUL_SENSOR,
+    MESH_DEVICE_BACKHAUL_SIGNAL_SENSOR,
+    MESH_DEVICE_BACKHAUL_TX_RATE_SENSOR,
     MESH_DEVICE_CONNECTED_SENSOR,
     MESH_DEVICE_FIRMWARE_SENSOR,
     MESH_DEVICE_HARDWARE_SENSOR,
@@ -78,6 +81,39 @@ _WAN_DUPLICATE_MODEM_KEYS = {
 _WAN_REMOVED_SENSOR_KEYS = {
     "mac_address",
 }
+
+# Mesh node details that do not warrant their own entity. Only values that hold
+# still between refreshes belong here: these attributes are shared by every
+# sensor of the node, and anything that moves on each poll would make all of
+# them write a state row every time.
+_MESH_DETAIL_ATTRIBUTES = (
+    "mesh_type",
+    "backhaul_interface",
+    "backhaul_bandwidth",
+    "backhaul_standard",
+    "backhaul_bssid",
+    "hop",
+    "parent_mac",
+)
+
+# Per-chain readings belong to the signal sensor, which is a measurement and is
+# expected to change on every refresh anyway.
+_MESH_SIGNAL_ATTRIBUTES = (
+    "backhaul_signal_chain0",
+    "backhaul_signal_chain1",
+    "backhaul_signal_chain2",
+    "backhaul_signal_chain3",
+)
+
+# Fields of each client published in the node's device list. Live throughput and
+# connection age are deliberately left out: they change on every refresh, and
+# they are already available per client from the router's own device list.
+_MESH_CLIENT_ATTRIBUTES = (
+    "hostname",
+    "connection",
+    "ip_address",
+    "mac_address",
+)
 
 _LOAD_BALANCING_DYNAMIC_KEYS = {f"wan{interface_number}_status" for interface_number in range(1, 5)}
 _WISP_SENSOR_KEYS = {
@@ -472,6 +508,24 @@ async def async_setup_entry(
                     MESH_DEVICE_BACKHAUL_SENSOR,
                 )
             )
+            # Link quality only exists for nodes on a wireless backhaul; a node
+            # wired back to the main router would report these as unknown
+            # forever.
+            for description in (
+                MESH_DEVICE_BACKHAUL_SIGNAL_SENSOR,
+                MESH_DEVICE_BACKHAUL_TX_RATE_SENSOR,
+                MESH_DEVICE_BACKHAUL_RX_RATE_SENSOR,
+            ):
+                if mesh_device.get(description.key) is None:
+                    continue
+                _append_entity(
+                    CudyRouterMeshDeviceSensor(
+                        coordinator,
+                        mesh_mac,
+                        mesh_device,
+                        description,
+                    )
+                )
 
     @callback
     def _add_new_wan_interface_sensors() -> None:
@@ -551,7 +605,7 @@ class CudyRouterConnectedDeviceSensor(
         self._attr_unique_id = (
             f"{config_entry.entry_id}-device-{self._normalized_mac}-{description.key}"
         )
-        self._attr_device_info = build_client_device_info(config_entry, device)
+        self._attr_device_info = build_client_device_info(coordinator.hass, config_entry, device)
 
     def _current_device(self) -> dict[str, Any]:
         """Return the latest device payload."""
@@ -579,6 +633,9 @@ class CudyRouterMeshDeviceSensor(CoordinatorEntity[CudyRouterDataUpdateCoordinat
     """Implementation of a Cudy Router mesh device sensor."""
 
     _attr_has_entity_name = True
+    # A busy node lists dozens of clients; keeping that out of the database
+    # avoids writing kilobytes of history on every refresh.
+    _unrecorded_attributes = frozenset({"devices"})
     entity_description: CudyRouterSensorEntityDescription
 
     def __init__(
@@ -595,7 +652,9 @@ class CudyRouterMeshDeviceSensor(CoordinatorEntity[CudyRouterDataUpdateCoordinat
         self._mesh_name = mesh_display_name(mesh_device.get("name"), mesh_mac)
         self._attr_name = description.name_suffix
         self._attr_unique_id = f"{coordinator.config_entry.entry_id}-mesh-{mesh_mac}-{description.key}"
-        self._attr_device_info = build_mesh_device_info(coordinator, mesh_mac, mesh_device)
+        self._attr_device_info = build_mesh_device_info(
+            coordinator.hass, coordinator, mesh_mac, mesh_device
+        )
 
     @property
     def native_value(self) -> StateType:
@@ -619,8 +678,9 @@ class CudyRouterMeshDeviceSensor(CoordinatorEntity[CudyRouterDataUpdateCoordinat
         device = mesh_devices.get(self._mesh_mac)
         if not device:
             return {}
-        # Return all mesh device info as attributes
-        return {
+
+        # Shared identity and backhaul details, on every sensor of the node.
+        attributes: dict[str, Any] = {
             "mac_address": device.get("mac_address"),
             "model": device.get("model"),
             "hardware": device.get("hardware"),
@@ -629,6 +689,29 @@ class CudyRouterMeshDeviceSensor(CoordinatorEntity[CudyRouterDataUpdateCoordinat
             "ip_address": device.get("ip_address"),
             "backhaul": device.get("backhaul"),
         }
+        for key in _MESH_DETAIL_ATTRIBUTES:
+            value = device.get(key)
+            if value is not None:
+                attributes[key] = value
+
+        if self.entity_description.key == "backhaul_signal":
+            for key in _MESH_SIGNAL_ATTRIBUTES:
+                value = device.get(key)
+                if value is not None:
+                    attributes[key] = value
+
+        # The client list is only attached to the sensor that counts them, so
+        # it is not repeated on every sensor of the node.
+        if self.entity_description.key == "connected_devices":
+            client_devices = device.get("client_devices")
+            if isinstance(client_devices, list):
+                attributes["devices"] = [
+                    {key: client.get(key) for key in _MESH_CLIENT_ATTRIBUTES}
+                    for client in client_devices
+                    if isinstance(client, dict)
+                ]
+
+        return attributes
 
 
 class CudyRouterSensor(CoordinatorEntity[CudyRouterDataUpdateCoordinator], SensorEntity):

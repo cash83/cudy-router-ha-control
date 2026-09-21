@@ -30,6 +30,7 @@ from .const import (
     OPTIONS_DEVICELIST,
 )
 from .features import existing_feature
+from .mesh import node_telemetry
 from .parser import (
     parse_data_usage,
     parse_devices,
@@ -1075,7 +1076,8 @@ async def collect_router_data(
                 "hardware": hardware,
                 "status": "online" if client_json.get("state") == "connected" else "offline",
                 "led_status": sysreport.get("ledstatus"),
-                "backhaul": sysreport.get("backhaul"),
+                # Backhaul link, load and client count, when the node reports them.
+                **node_telemetry(client_json),
             }
             _LOGGER.debug(
                 "Parsed mesh client from JSON: %s -> %s",
@@ -1131,9 +1133,13 @@ async def collect_router_data(
                     _LOGGER.debug("Parsed HTML info for %s: %s", formatted_mac, html_info)
                     # Merge HTML data, but prefer JSON data for fields that exist in both
                     for key, value in html_info.items():
-                        # For connected_devices, always use HTML value (JSON doesn't have this)
+                        # The client list published as attributes comes from the
+                        # devlist page, so its count wins to stay consistent with
+                        # it. When that page returned nothing the node's own
+                        # devcnt is the better answer than zero.
                         if key == "connected_devices":
-                            client_info[key] = value
+                            if value or not client_info.get(key):
+                                client_info[key] = value
                         elif (
                             key not in client_info or not client_info.get(key) or client_info.get(key) == "Unknown"
                         ):

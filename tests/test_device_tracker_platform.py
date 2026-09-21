@@ -364,7 +364,10 @@ def test_device_tracker_platform_uses_scanner_entity_for_router_presence() -> No
     """Router-backed device trackers should report home/not_home via ScannerEntity."""
     source = DEVICE_TRACKER_PATH.read_text(encoding="utf-8")
 
-    assert "from homeassistant.components.device_tracker.config_entry import ScannerEntity" in source
+    assert "from homeassistant.components.device_tracker import ScannerEntity, SourceType" in source
+    # The config_entry module only re-exports ScannerEntity as a deprecated
+    # alias, dropped in HA Core 2027.6.
+    assert "device_tracker.config_entry import" not in source
     assert "CoordinatorEntity[CudyRouterDataUpdateCoordinator], ScannerEntity" in source
 
 

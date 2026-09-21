@@ -10,6 +10,22 @@ from tests.module_loader import load_cudy_module
 device_info = load_cudy_module("device_info")
 
 
+def _use_device_registry(device_registry: SimpleNamespace) -> None:
+    """Install a device-registry double, with the lookups device_info performs."""
+    devices = lambda: getattr(device_registry, "devices", {})
+    device_registry.async_get = lambda device_id: devices().get(device_id)
+    device_registry.async_get_device_by_identifier = lambda identifier, config_entry_id: next(
+        (
+            device
+            for device in devices().values()
+            if identifier in getattr(device, "identifiers", set())
+            and config_entry_id in getattr(device, "config_entries", set())
+        ),
+        None,
+    )
+    device_info.async_get_device_registry = lambda hass: device_registry
+
+
 def _coordinator(data: dict, *, entry_id: str = "entry-1", model: str = "P5") -> SimpleNamespace:
     return SimpleNamespace(
         config_entry=SimpleNamespace(entry_id=entry_id, data={"model": model}),
@@ -37,27 +53,64 @@ def test_router_device_info_includes_name_model_firmware_and_mac_connection() ->
     assert info["connections"] == {("mac", "aa:bb:cc:dd:ee:ff")}
 
 
+def _registry_with_router(*, registered: bool = True) -> SimpleNamespace:
+    """A registry double holding the router device that children hang from."""
+    devices = {}
+    if registered:
+        devices["router-device-id"] = SimpleNamespace(
+            id="router-device-id",
+            config_entries={"entry-1"},
+            identifiers={("cudy_router", "entry-1")},
+        )
+    return SimpleNamespace(devices=devices)
+
+
 def test_client_device_info_uses_client_name_and_parent_router_without_cudy_manufacturer() -> None:
     """Client devices should be attached under the router and identified by their own MAC."""
+    _use_device_registry(_registry_with_router())
     config_entry = SimpleNamespace(entry_id="entry-1")
 
     info = device_info.build_client_device_info(
+        object(),
         config_entry,
         {"hostname": "Living Room TV", "mac": "AA:BB:CC:DD:EE:42"},
     )
 
     assert info["identifiers"] == {("cudy_router", "entry-1-device-aabbccddee42")}
     assert info["name"] == "Living Room TV"
-    assert info["via_device"] == ("cudy_router", "entry-1")
+    # The parent is referenced by its registry id, not by its identifiers.
+    assert info["via_device_id"] == "router-device-id"
     assert info["connections"] == {("mac", "aa:bb:cc:dd:ee:42")}
     assert "manufacturer" not in info
 
 
+def test_child_devices_omit_the_parent_link_until_the_router_is_registered() -> None:
+    """Passing via_device_id=None would clear the link, so the key is left out."""
+    _use_device_registry(_registry_with_router(registered=False))
+
+    client = device_info.build_client_device_info(
+        object(),
+        SimpleNamespace(entry_id="entry-1"),
+        {"mac": "AA:BB:CC:DD:EE:42"},
+    )
+    node = device_info.build_mesh_device_info(
+        object(),
+        _coordinator({}),
+        "AA:BB:CC:DD:EE:11",
+        {"name": "Bedroom"},
+    )
+
+    assert "via_device_id" not in client
+    assert "via_device_id" not in node
+
+
 def test_mesh_device_info_prefixes_mesh_name_and_splits_hardware_version() -> None:
     """Mesh nodes should get distinct names and richer model metadata."""
+    _use_device_registry(_registry_with_router())
     coordinator = _coordinator({})
 
     info = device_info.build_mesh_device_info(
+        object(),
         coordinator,
         "AA:BB:CC:DD:EE:11",
         {
@@ -75,7 +128,7 @@ def test_mesh_device_info_prefixes_mesh_name_and_splits_hardware_version() -> No
     assert info["model"] == "RE1200"
     assert info["hw_version"] == "V1.0"
     assert info["sw_version"] == "2.4.20"
-    assert info["via_device"] == ("cudy_router", "entry-1")
+    assert info["via_device_id"] == "router-device-id"
     assert info["connections"] == {("mac", "aa:bb:cc:dd:ee:11")}
 
 
@@ -181,7 +234,7 @@ def test_stale_client_cleanup_removes_only_missing_client_entities() -> None:
 
     registry.async_remove = _remove
     device_info.async_get_entity_registry = lambda hass: registry
-    device_info.async_get_device_registry = lambda hass: device_registry
+    _use_device_registry(device_registry)
 
     device_info.async_cleanup_stale_client_entities(
         object(),
@@ -237,7 +290,7 @@ def test_stale_client_cleanup_keeps_shared_client_device_when_tracker_entity_rem
 
     registry.async_remove = _remove
     device_info.async_get_entity_registry = lambda hass: registry
-    device_info.async_get_device_registry = lambda hass: device_registry
+    _use_device_registry(device_registry)
 
     device_info.async_cleanup_stale_client_entities(
         object(),
@@ -329,7 +382,7 @@ def test_stale_client_cleanup_falls_back_to_entity_id_when_domain_is_missing() -
 
     registry.async_remove = _remove
     device_info.async_get_entity_registry = lambda hass: registry
-    device_info.async_get_device_registry = lambda hass: device_registry
+    _use_device_registry(device_registry)
 
     device_info.async_cleanup_stale_client_entities(
         object(),
@@ -385,7 +438,7 @@ def test_stale_client_cleanup_removes_device_after_sensor_and_switch_pruning() -
 
     registry.async_remove = _remove
     device_info.async_get_entity_registry = lambda hass: registry
-    device_info.async_get_device_registry = lambda hass: device_registry
+    _use_device_registry(device_registry)
 
     device_info.async_cleanup_stale_client_entities(
         object(),
@@ -444,7 +497,7 @@ def test_known_client_devices_collect_names_and_switch_features() -> None:
     )
 
     device_info.async_get_entity_registry = lambda hass: registry
-    device_info.async_get_device_registry = lambda hass: device_registry
+    _use_device_registry(device_registry)
 
     known_clients = device_info.known_client_devices(
         object(),
@@ -478,7 +531,7 @@ def test_known_client_devices_ignore_non_client_domains_with_mac_like_unique_ids
     )
 
     device_info.async_get_entity_registry = lambda hass: registry
-    device_info.async_get_device_registry = lambda hass: device_registry
+    _use_device_registry(device_registry)
 
     known_clients = device_info.known_client_devices(
         object(),
@@ -514,7 +567,7 @@ def test_known_tracker_clients_reads_tracker_entities_from_registries() -> None:
     )
 
     device_info.async_get_entity_registry = lambda hass: registry
-    device_info.async_get_device_registry = lambda hass: device_registry
+    _use_device_registry(device_registry)
 
     known_clients = device_info.known_tracker_clients(
         object(),
@@ -555,7 +608,7 @@ def test_known_tracker_clients_reads_legacy_mac_unique_ids() -> None:
     )
 
     device_info.async_get_entity_registry = lambda hass: registry
-    device_info.async_get_device_registry = lambda hass: device_registry
+    _use_device_registry(device_registry)
 
     known_clients = device_info.known_tracker_clients(
         object(),
@@ -575,10 +628,9 @@ def test_async_ensure_client_entity_device_links_legacy_tracker_entries() -> Non
     create_calls: list[dict[str, object]] = []
     update_calls: list[tuple[str, dict[str, str]]] = []
 
-    device_registry = SimpleNamespace(
-        async_get_or_create=lambda **kwargs: (
-            create_calls.append(kwargs) or SimpleNamespace(id="client_tracker")
-        )
+    device_registry = _registry_with_router()
+    device_registry.async_get_or_create = lambda **kwargs: (
+        create_calls.append(kwargs) or SimpleNamespace(id="client_tracker")
     )
     registry = SimpleNamespace(
         entities={
@@ -605,7 +657,7 @@ def test_async_ensure_client_entity_device_links_legacy_tracker_entries() -> Non
     registry.async_update_entity = _update_entity
 
     device_info.async_get_entity_registry = lambda hass: registry
-    device_info.async_get_device_registry = lambda hass: device_registry
+    _use_device_registry(device_registry)
 
     device_id = device_info.async_ensure_client_entity_device(
         object(),
@@ -622,7 +674,7 @@ def test_async_ensure_client_entity_device_links_legacy_tracker_entries() -> Non
             "identifiers": {("cudy_router", "entry-1-device-aabbccddee42")},
             "connections": {("mac", "aa:bb:cc:dd:ee:42")},
             "name": "Living Room TV",
-            "via_device": ("cudy_router", "entry-1"),
+            "via_device_id": "router-device-id",
         }
     ]
     assert update_calls == [
@@ -646,7 +698,7 @@ def test_known_tracker_clients_ignore_plain_client_devices_without_tracker_entit
     registry = SimpleNamespace(entities={})
 
     device_info.async_get_entity_registry = lambda hass: registry
-    device_info.async_get_device_registry = lambda hass: device_registry
+    _use_device_registry(device_registry)
 
     known_clients = device_info.known_tracker_clients(
         object(),
@@ -713,7 +765,7 @@ def test_stale_tracker_cleanup_removes_only_disallowed_tracker_entities() -> Non
 
     registry.async_remove = _remove
     device_info.async_get_entity_registry = lambda hass: registry
-    device_info.async_get_device_registry = lambda hass: device_registry
+    _use_device_registry(device_registry)
 
     device_info.async_cleanup_stale_tracker_entities(
         object(),
@@ -757,7 +809,7 @@ def test_stale_tracker_cleanup_removes_legacy_mac_unique_id_entities() -> None:
 
     registry.async_remove = _remove
     device_info.async_get_entity_registry = lambda hass: registry
-    device_info.async_get_device_registry = lambda hass: device_registry
+    _use_device_registry(device_registry)
 
     device_info.async_cleanup_stale_tracker_entities(
         object(),
@@ -800,7 +852,7 @@ def test_stale_tracker_cleanup_prunes_noncanonical_duplicates_for_allowed_macs()
 
     registry.async_remove = _remove
     device_info.async_get_entity_registry = lambda hass: registry
-    device_info.async_get_device_registry = lambda hass: device_registry
+    _use_device_registry(device_registry)
 
     device_info.async_cleanup_stale_tracker_entities(
         object(),
@@ -810,3 +862,43 @@ def test_stale_tracker_cleanup_prunes_noncanonical_duplicates_for_allowed_macs()
     )
 
     assert registry.removed == ["device_tracker.client_duplicate"]
+
+
+def test_router_device_is_registered_with_its_own_identifiers() -> None:
+    """Children look the router up by identifiers, so registration must use them."""
+    create_calls: list[dict[str, object]] = []
+    device_registry = SimpleNamespace(devices={})
+    device_registry.async_get_or_create = lambda **kwargs: (
+        create_calls.append(kwargs) or SimpleNamespace(id="router-device-id")
+    )
+    _use_device_registry(device_registry)
+
+    coordinator = _coordinator({"system": {"firmware_version": {"value": "2.4.25"}}})
+    expected = device_info.build_router_device_info(coordinator)
+
+    device_id = device_info.async_register_router_device(object(), coordinator)
+
+    assert device_id == "router-device-id"
+    assert len(create_calls) == 1
+    assert create_calls[0]["config_entry_id"] == "entry-1"
+    # The identifiers have to match what async_router_device_id looks up.
+    assert create_calls[0]["identifiers"] == expected["identifiers"]
+    assert create_calls[0]["name"] == expected["name"]
+    assert create_calls[0]["sw_version"] == expected["sw_version"]
+
+
+def test_setup_registers_the_router_before_forwarding_platforms() -> None:
+    """A platform that builds entities first would find no parent to attach to."""
+    from pathlib import Path
+
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "custom_components"
+        / "cudy_router"
+        / "__init__.py"
+    ).read_text(encoding="utf-8")
+
+    registration = source.index("async_register_router_device(hass, coordinator)")
+    forwarding = source.index("async_forward_entry_setups(entry, PLATFORMS)")
+
+    assert registration < forwarding

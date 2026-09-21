@@ -1447,3 +1447,78 @@ def test_collect_router_data_skips_sms_module_for_non_sms_models(monkeypatch) ->
     )
 
     assert const.MODULE_SMS not in data
+
+
+def _mesh_fixture(name: str) -> str:
+    return _fixture_text("mesh", name)
+
+
+def _mesh_pages(devlist: str | None = None) -> dict[str, str]:
+    """Pages a mesh-capable router serves during a refresh."""
+    devlist_html = _mesh_fixture("mesh_client_devlist.html") if devlist is None else devlist
+    return {
+        "admin/network/mesh/status": (
+            '<div class="panel"><table><tr>'
+            '<td><div id="cbi-table-1-content">Device Name</div></td>'
+            '<td><div id="cbi-table-1-data">Living Room</div></td>'
+            "</tr></table></div>"
+        ),
+        "admin/network/mesh/clients?clients=all": _mesh_fixture("mesh_clients.json"),
+        "admin/network/mesh/client/devstatus?embedded=&client=AABBCC112244": (
+            "<table><tr>"
+            '<td><div id="cbi-table-1-content">Status</div></td>'
+            '<td><div id="cbi-table-1-data">Online</div></td>'
+            "</tr></table>"
+        ),
+        "admin/network/mesh/client/devlist?embedded=&client=AABBCC112244": devlist_html,
+    }
+
+
+def _collect_mesh(monkeypatch, pages: dict[str, str]) -> dict:
+    monkeypatch.setattr(
+        router_data,
+        "existing_feature",
+        lambda device_model, module: module == const.MODULE_MESH,
+    )
+    return asyncio.run(
+        router_data.collect_router_data(_FakeRouter(pages), _FakeHass(), {}, "M3000")
+    )
+
+
+def test_collect_router_data_exposes_mesh_backhaul_quality(monkeypatch) -> None:
+    """A satellite's backhaul link quality should reach the coordinator data."""
+    data = _collect_mesh(monkeypatch, _mesh_pages())
+
+    node = data[const.MODULE_MESH]["mesh_devices"]["AA:BB:CC:11:22:44"]
+
+    assert node["backhaul"] == "Wi-Fi 5 GHz"
+    assert node["backhaul_interface"] == "wlan11"
+    assert node["backhaul_signal"] == -58
+    assert node["backhaul_tx_rate"] == 2161
+    assert node["backhaul_rx_rate"] == 1729
+    assert node["backhaul_bandwidth"] == "160 MHz"
+    assert node["cpu_load"] == 5
+
+
+def test_collect_router_data_exposes_mesh_client_devices(monkeypatch) -> None:
+    """The end devices of a node should be carried alongside their count."""
+    data = _collect_mesh(monkeypatch, _mesh_pages())
+
+    node = data[const.MODULE_MESH]["mesh_devices"]["AA:BB:CC:11:22:44"]
+
+    assert node["connected_devices"] == 3
+    assert [device["hostname"] for device in node["client_devices"]] == [
+        "tablet-hall",
+        "sensor-kitchen...",
+        "nas-box",
+    ]
+
+
+def test_collect_router_data_keeps_reported_count_when_devlist_is_empty(monkeypatch) -> None:
+    """Losing the devlist page must not report zero clients for a live node."""
+    data = _collect_mesh(monkeypatch, _mesh_pages(devlist=""))
+
+    node = data[const.MODULE_MESH]["mesh_devices"]["AA:BB:CC:11:22:44"]
+
+    # The node itself reports 30 clients; only the enumeration was unavailable.
+    assert node["connected_devices"] == 30

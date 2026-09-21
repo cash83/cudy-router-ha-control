@@ -4,8 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from homeassistant.components.device_tracker import SourceType
-from homeassistant.components.device_tracker.config_entry import ScannerEntity
+from homeassistant.components.device_tracker import ScannerEntity, SourceType
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -153,7 +152,7 @@ class CudyRouterDeviceTracker(
             }
         )
         self._attr_unique_id = self._mac or self._normalized_mac
-        self._attr_device_info = build_client_device_info(config_entry, device)
+        self._attr_device_info = build_client_device_info(coordinator.hass, config_entry, device)
 
     def _find_current_device(self) -> dict[str, Any] | None:
         """Return the current device payload for this tracker."""

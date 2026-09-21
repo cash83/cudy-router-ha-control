@@ -857,3 +857,33 @@ MESH_DEVICE_BACKHAUL_SENSOR = CudyRouterSensorEntityDescription(
     icon="mdi:lan-connect",
     entity_category=EntityCategory.DIAGNOSTIC,
 )
+
+MESH_DEVICE_BACKHAUL_SIGNAL_SENSOR = CudyRouterSensorEntityDescription(
+    key="backhaul_signal",
+    module="mesh",
+    name_suffix="Backhaul signal",
+    device_class=SensorDeviceClass.SIGNAL_STRENGTH,
+    native_unit_of_measurement=SIGNAL_STRENGTH_DECIBELS_MILLIWATT,
+    state_class=SensorStateClass.MEASUREMENT,
+    entity_category=EntityCategory.DIAGNOSTIC,
+)
+
+MESH_DEVICE_BACKHAUL_TX_RATE_SENSOR = CudyRouterSensorEntityDescription(
+    key="backhaul_tx_rate",
+    module="mesh",
+    name_suffix="Backhaul TX rate",
+    device_class=SensorDeviceClass.DATA_RATE,
+    native_unit_of_measurement=UnitOfDataRate.MEGABITS_PER_SECOND,
+    state_class=SensorStateClass.MEASUREMENT,
+    entity_category=EntityCategory.DIAGNOSTIC,
+)
+
+MESH_DEVICE_BACKHAUL_RX_RATE_SENSOR = CudyRouterSensorEntityDescription(
+    key="backhaul_rx_rate",
+    module="mesh",
+    name_suffix="Backhaul RX rate",
+    device_class=SensorDeviceClass.DATA_RATE,
+    native_unit_of_measurement=UnitOfDataRate.MEGABITS_PER_SECOND,
+    state_class=SensorStateClass.MEASUREMENT,
+    entity_category=EntityCategory.DIAGNOSTIC,
+)

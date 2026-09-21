@@ -1190,6 +1190,36 @@ def parse_data_size_bytes(size_str: str) -> int | None:
     return int(round(value * multipliers[unit]))
 
 
+# Headings the Cudy mesh pages render in a panel of their own. They are short
+# and read like device names, so without this they are mistaken for nodes.
+_MESH_SECTION_LABELS = {
+    "mesh",
+    "mesh units",
+    "mesh status",
+    "mesh network",
+    "device name",
+    "more details",
+}
+
+
+def _collapse_layout_duplicates(text_content: str) -> str:
+    """Drop the duplicate lines the Cudy UI renders for narrow layouts.
+
+    Every value is written twice, once for the wide layout and once for the
+    narrow one, so the extracted text repeats each line. Collapsing the repeats
+    keeps names and hashes derived from them stable.
+    """
+    lines: list[str] = []
+    for raw_line in text_content.split("\n"):
+        line = raw_line.strip()
+        if not line:
+            continue
+        if lines and lines[-1] == line:
+            continue
+        lines.append(line)
+    return "\n".join(lines)
+
+
 def _generate_pseudo_mac(name: str) -> str:
     """Generate a deterministic pseudo-MAC address from a device name.
 
@@ -1341,6 +1371,90 @@ def parse_mesh_devices(input_html: str) -> dict[str, Any]:
     return data
 
 
+_MESH_DEVLIST_ROW_RE = re.compile(r"cbi-table-(\d+)$")
+_MESH_RATE_RE = re.compile(r"([\d.]+)\s*([kmg]?)bps", re.IGNORECASE)
+_RATE_MULTIPLIERS = {"": 0.001, "k": 1.0, "m": 1000.0, "g": 1000000.0}
+
+
+def _mesh_devlist_cell_lines(row: Any, row_id: str, field: str) -> list[str]:
+    """Return the text lines of one mesh devlist cell.
+
+    Each cell holds the same value twice, once for the desktop layout and once
+    for the narrow one, so only the first paragraph is read. Values inside a
+    paragraph are separated by ``<br>``.
+    """
+    cell = row.find("div", id=f"cbi-table-{row_id}-{field}")
+    if cell is None:
+        return []
+    paragraph = cell.find("p")
+    if paragraph is None:
+        paragraph = cell
+    for line_break in paragraph.find_all("br"):
+        line_break.replace_with("\n")
+    return [line.strip() for line in paragraph.get_text().split("\n") if line.strip()]
+
+
+def _mesh_rate_to_kbps(value: str | None) -> float | None:
+    """Convert a reported rate ("2.23 Kbps") to kbps."""
+    if not value:
+        return None
+    match = _MESH_RATE_RE.search(value)
+    if not match:
+        return None
+    multiplier = _RATE_MULTIPLIERS.get(match.group(2).lower())
+    if multiplier is None:
+        return None
+    try:
+        return round(float(match.group(1)) * multiplier, 2)
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_mesh_client_devices(devlist_html: str | None) -> list[dict[str, Any]]:
+    """Parse the end devices connected to a single mesh node.
+
+    Reads ``admin/network/mesh/client/devlist``, which lists one row per client
+    with its hostname, how it is attached, addresses, live throughput and how
+    long it has been connected. Hostnames are truncated by the router's own UI
+    and are returned as reported; the MAC address is the stable key.
+    """
+    devices: list[dict[str, Any]] = []
+    if not devlist_html:
+        return devices
+
+    soup = BeautifulSoup(devlist_html, "html.parser")
+    for row in soup.find_all("tr", id=_MESH_DEVLIST_ROW_RE):
+        match = _MESH_DEVLIST_ROW_RE.search(row.get("id", ""))
+        if not match:
+            continue
+        row_id = match.group(1)
+
+        hostname_lines = _mesh_devlist_cell_lines(row, row_id, "hostname")
+        ipmac_lines = _mesh_devlist_cell_lines(row, row_id, "ipmac")
+        speed_lines = _mesh_devlist_cell_lines(row, row_id, "speed")
+        online_lines = _mesh_devlist_cell_lines(row, row_id, "online")
+
+        joined = " ".join(ipmac_lines)
+        mac_match = _MAC_RE.search(joined)
+        ip_match = _IP_RE.search(joined)
+
+        device: dict[str, Any] = {
+            "hostname": hostname_lines[0] if hostname_lines else None,
+            "connection": hostname_lines[1] if len(hostname_lines) > 1 else None,
+            "ip_address": ip_match.group(0) if ip_match else None,
+            "mac_address": mac_match.group(0).upper().replace("-", ":") if mac_match else None,
+            "tx_rate_kbps": _mesh_rate_to_kbps(speed_lines[0] if speed_lines else None),
+            "rx_rate_kbps": _mesh_rate_to_kbps(speed_lines[1] if len(speed_lines) > 1 else None),
+            "connected_time": online_lines[0] if online_lines else None,
+        }
+
+        if device["mac_address"] or device["hostname"]:
+            devices.append(device)
+
+    _LOGGER.debug("Parsed %d mesh client devices", len(devices))
+    return devices
+
+
 def parse_mesh_client_status(devstatus_html: str, devlist_html: str | None = None) -> dict[str, Any] | None:
     """Parse mesh client device status page to extract detailed info.
 
@@ -1363,6 +1477,7 @@ def parse_mesh_client_status(devstatus_html: str, devlist_html: str | None = Non
         "firmware_version": None,
         "backhaul": None,
         "connected_devices": 0,
+        "client_devices": [],
         "status": "online",
     }
 
@@ -1400,12 +1515,11 @@ def parse_mesh_client_status(devstatus_html: str, devlist_html: str | None = Non
                 elif "offline" in value.lower():
                     device_info["status"] = "offline"
 
-    # Parse connected devices count from devlist page
+    # Parse the connected devices themselves from the devlist page
     if devlist_html:
-        devlist_soup = BeautifulSoup(devlist_html, "html.parser")
-        # Count rows in the device table (excluding header)
-        device_rows = devlist_soup.find_all("tr", id=re.compile(r"cbi-table-\d+"))
-        device_info["connected_devices"] = len(device_rows)
+        client_devices = parse_mesh_client_devices(devlist_html)
+        device_info["client_devices"] = client_devices
+        device_info["connected_devices"] = len(client_devices)
         _LOGGER.debug(
             "Mesh client %s has %d connected devices",
             device_info.get("name") or device_info.get("mac_address"),
@@ -1500,13 +1614,23 @@ def _extract_cudy_mesh_device(element, index: int) -> dict[str, Any] | None:
     loaded via JavaScript/AJAX and not available in the page source. These fields
     will show as None/Unknown for satellite devices.
     """
-    text_content = element.get_text(separator="\n", strip=True)
+    text_content = _collapse_layout_duplicates(element.get_text(separator="\n", strip=True))
     text_lower = text_content.lower().strip()
+
+    # Skip the page's own section headings. They are short and read like device
+    # names, but they label the page rather than describe a node.
+    if text_lower in _MESH_SECTION_LABELS:
+        return None
 
     # Check if this is a short panel with just a device name (common for Cudy satellites)
     # Satellite devices may just show as "Mesh", "Satellite", "Node1", etc.
     short_device_names = ["mesh", "satellite", "node", "extender", "repeater"]
-    is_short_device_name = any(text_lower == name or text_lower.startswith(name + " ") for name in short_device_names)
+    first_line = text_content.split("\n", 1)[0].strip()
+    first_line_lower = first_line.lower()
+    is_short_device_name = any(
+        first_line_lower == name or first_line_lower.startswith(name + " ")
+        for name in short_device_names
+    )
 
     # Skip if this doesn't look like a device panel (too short or no useful content)
     # BUT allow short valid device names
@@ -1542,8 +1666,9 @@ def _extract_cudy_mesh_device(element, index: int) -> dict[str, Any] | None:
     # Try to find actual device names (not labels)
     # First check if this is a short panel with just a device name like "Mesh"
     if is_short_device_name:
-        # The panel text IS the device name
-        device_info["name"] = text_content.strip()
+        # The panel text IS the device name. Only its first line: anything below
+        # is other content, and must not end up inside the name.
+        device_info["name"] = first_line
         _LOGGER.debug("Mesh: Found short device name panel: %s", device_info["name"])
     else:
         # Look for specific device type names first
@@ -1594,9 +1719,12 @@ def _extract_cudy_mesh_device(element, index: int) -> dict[str, Any] | None:
     if not device_info.get("name"):
         return None
 
-    # Generate a pseudo-MAC if needed (based on name)
+    # Generate a pseudo-MAC if needed (based on name). It keys the node in the
+    # registry, and is recorded as generated so it is never published as if it
+    # were the hardware's real address.
     if not device_info["mac_address"]:
         device_info["mac_address"] = _generate_pseudo_mac(device_info["name"])
+        device_info["generated_mac"] = device_info["mac_address"]
 
     return device_info
 
