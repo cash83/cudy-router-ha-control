@@ -23,5 +23,9 @@ def test_config_flow_uses_shared_scan_interval_constants() -> None:
 def test_coordinator_uses_normalized_scan_interval() -> None:
     """Coordinator should normalize interval before building timedelta."""
     source = COORDINATOR_PATH.read_text(encoding="utf-8")
-    assert "from .const import DEFAULT_SCAN_INTERVAL, DOMAIN, normalize_scan_interval" in source
+    # Pinning the whole import line would break on any unrelated constant
+    # added to it, so only the constants this test is about are required.
+    assert "from .const import " in source
+    assert "DEFAULT_SCAN_INTERVAL" in source
+    assert "normalize_scan_interval" in source
     assert "scan_interval = normalize_scan_interval(" in source

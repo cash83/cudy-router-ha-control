@@ -149,6 +149,41 @@ async def async_fetch_sms_data(
     }
 
 
+def latest_message_attributes(message: dict[str, Any] | None) -> dict[str, Any]:
+    """Return the sender, text and time of a received message for automations.
+
+    Exposed as attributes of the inbox sensor so a notification can quote the
+    message itself, which the counts alone cannot do.
+    """
+    if not isinstance(message, dict):
+        return {}
+
+    text = message.get("text") or message.get("preview")
+    return {
+        key: value
+        for key, value in (
+            ("last_sender", message.get("phone")),
+            ("last_message", text),
+            ("last_received", message.get("timestamp")),
+        )
+        if value not in (None, "")
+    }
+
+
+async def async_fetch_latest_inbox_message(
+    hass: HomeAssistant,
+    router: Any,
+) -> dict[str, Any] | None:
+    """Return the most recently received message, or None when there is none.
+
+    The router lists the inbox newest first.
+    """
+    messages, available = await _async_fetch_sms_mailbox(router, hass, "rec")
+    if not available or not messages:
+        return None
+    return messages[0]
+
+
 def interpret_send_sms_result(status_code: int, response_text: str) -> dict[str, Any]:
     """Normalize the router's send-SMS response."""
     snippet = (response_text or "").strip()

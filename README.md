@@ -35,7 +35,29 @@ Other Cudy models may work when their firmware exposes compatible LuCI pages, bu
 - Mesh devices connected sensor on routers that report mesh topology.
 - Per mesh node: backhaul type, backhaul signal and TX/RX rates on wireless nodes, and the list of end devices attached to that node as attributes of its connected devices sensor.
 - Connected-client controls and optional device tracker entities.
+- The SMS inbox sensor carries the newest received message, so an automation can notify you with its sender and text.
 - HACS custom repository support.
+
+## Notify on a received SMS
+
+The inbox sensor exposes `last_sender`, `last_message` and `last_received` as attributes. The mailbox
+is only read when the router reports more received messages than before, so this costs no extra
+requests while nothing arrives.
+
+```yaml
+triggers:
+  - trigger: state
+    entity_id: sensor.your_router_sms_inbox
+conditions:
+  # Only when the count went up: a restart or a deletion is not a new message.
+  - "{{ trigger.from_state.state not in ['unknown', 'unavailable'] and
+        trigger.to_state.state | int(0) > trigger.from_state.state | int(0) }}"
+actions:
+  - action: notify.mobile_app_your_phone
+    data:
+      title: "SMS from {{ state_attr('sensor.your_router_sms_inbox', 'last_sender') }}"
+      message: "{{ state_attr('sensor.your_router_sms_inbox', 'last_message') }}"
+```
 
 ## Installation
 

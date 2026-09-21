@@ -222,3 +222,36 @@ def test_coordinator_supports_sms_rejects_known_non_sms_models_even_with_fallbac
     )
 
     assert sms.coordinator_supports_sms(coordinator) is False
+
+
+def test_latest_message_attributes_quote_sender_text_and_time() -> None:
+    """A notification needs the message itself, which the counts cannot give."""
+    attributes = sms.latest_message_attributes(
+        {
+            "phone": "+390000000000",
+            "text": "Il tuo credito residuo e' di 5 euro",
+            "timestamp": "09/21/26, 05:16:50",
+            "cfg": "cfg02ab7b",
+        }
+    )
+
+    assert attributes == {
+        "last_sender": "+390000000000",
+        "last_message": "Il tuo credito residuo e' di 5 euro",
+        "last_received": "09/21/26, 05:16:50",
+    }
+
+
+def test_latest_message_attributes_fall_back_to_the_preview() -> None:
+    """Some firmware only fills the listing preview, never the detail body."""
+    attributes = sms.latest_message_attributes({"phone": "+390000000000", "preview": "Ciao"})
+
+    assert attributes["last_message"] == "Ciao"
+    assert "last_received" not in attributes
+
+
+def test_latest_message_attributes_tolerate_junk() -> None:
+    """A missing or malformed message must not break a refresh."""
+    assert sms.latest_message_attributes(None) == {}
+    assert sms.latest_message_attributes({}) == {}
+    assert sms.latest_message_attributes({"phone": "", "text": None}) == {}
