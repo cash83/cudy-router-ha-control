@@ -441,9 +441,27 @@ def test_a_negative_plain_rssi_is_read_as_dbm() -> None:
     assert mesh.node_telemetry(node)["backhaul_signal"] == -60
 
 
-def test_a_positive_plain_rssi_is_ignored() -> None:
-    """There it is the dBm value offset by 100, and would read as a huge signal."""
+def test_a_positive_plain_rssi_is_the_reading_shifted_by_100() -> None:
+    """The WR3600E in #1 reports only `rssi`, as 41 and 44 for -59 and -56 dBm."""
     node = _wr3600e_node(bands="5G|2.4G", radio1_channel=100)
-    node["sysreport"]["sta"][1]["rssi"] = 42
+    node["sysreport"]["sta"][1]["rssi"] = 41
 
-    assert "backhaul_signal" not in mesh.node_telemetry(node)
+    assert mesh.node_telemetry(node)["backhaul_signal"] == -59
+
+
+def test_the_calibrated_field_still_wins_where_both_exist(satellite: dict) -> None:
+    """On the M3000 rssi is the same reading shifted, so it must not be preferred."""
+    station = mesh.select_backhaul_station(satellite["sysreport"])
+
+    assert station["rssi"] == 42 and station["rssireal"] == -58
+    assert mesh.node_telemetry(satellite)["backhaul_signal"] == -58
+
+
+def test_an_implausible_rssi_is_ignored_rather_than_reported() -> None:
+    """A field that means something else must not surface as a wrong signal."""
+    # 0 decodes to the -100 dBm floor: nothing was measured.
+    assert mesh.signal_from_plain_rssi(0) is None
+    # Neither a percentage-looking 150 nor junk should produce a reading.
+    assert mesh.signal_from_plain_rssi(150) is None
+    assert mesh.signal_from_plain_rssi("nonsense") is None
+    assert mesh.signal_from_plain_rssi(None) is None

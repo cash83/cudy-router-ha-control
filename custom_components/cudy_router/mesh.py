@@ -37,6 +37,13 @@ _WIFI_GENERATIONS = {
 
 WIRED_BACKHAUL_LABEL = "Ethernet"
 
+# Shift some firmware applies to keep its reported RSSI positive.
+_RSSI_POSITIVE_OFFSET = 100
+# A Wi-Fi link runs from roughly -30 dBm down to -95; -100 is the floor a
+# reading of zero would decode to, which means "nothing measured" rather than
+# an extraordinarily weak link.
+_WEAKEST_PLAUSIBLE_DBM = -100
+
 
 def radio_index(iface: str | None) -> int | None:
     """Return the radio index an interface name belongs to, if it names one."""
@@ -220,6 +227,28 @@ def _as_int(value: Any) -> int | None:
         return None
 
 
+def signal_from_plain_rssi(value: Any) -> int | None:
+    """Return a dBm reading from a bare ``rssi`` field, or None.
+
+    Firmware that omits ``rssireal`` reports the same measurement as ``rssi``,
+    shifted to keep it positive. On an M3000, where both fields are present,
+    ``rssi`` is exactly dBm + 100 (43 against -57, 42 against -58), and a
+    WR3600E that reports only ``rssi`` lands on the values its own web
+    interface shows.
+
+    A negative value is already dBm. A positive one is converted only when the
+    result falls inside the range a Wi-Fi link can occupy, so a field that
+    turns out to mean something else is ignored rather than published as a
+    wrong signal.
+    """
+    reported = _as_int(value)
+    if reported is None:
+        return None
+
+    dbm = reported if reported < 0 else reported - _RSSI_POSITIVE_OFFSET
+    return dbm if _WEAKEST_PLAUSIBLE_DBM < dbm < 0 else None
+
+
 def backhaul_details(sysreport: dict[str, Any] | None) -> dict[str, Any]:
     """Return the backhaul link quality fields a node reports.
 
@@ -262,9 +291,7 @@ def backhaul_details(sysreport: dict[str, Any] | None) -> dict[str, Any]:
         if chains:
             signal = max(chains)
     if signal is None:
-        reported = _as_int(station.get("rssi"))
-        if reported is not None and reported < 0:
-            signal = reported
+        signal = signal_from_plain_rssi(station.get("rssi"))
     if signal is not None:
         details["backhaul_signal"] = signal
 
