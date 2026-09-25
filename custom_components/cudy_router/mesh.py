@@ -55,25 +55,63 @@ def is_wired_iface(iface: str | None) -> bool:
     return bool(_WIRED_IFACE_RE.match(iface.strip()))
 
 
-def band_label(index: int | None, sysreport: dict[str, Any] | None) -> str | None:
+def _declared_bands(sysreport: dict[str, Any] | None) -> list[str]:
+    """Return the band labels a node lists in ``bands``, in the order given."""
+    bands = (sysreport or {}).get("bands")
+    if not isinstance(bands, str) or not bands:
+        return []
+    return [
+        label
+        for part in bands.split("|")
+        if (label := _BAND_LABELS.get(part.strip().lower()))
+    ]
+
+
+def is_wide_channel(bandwidth: Any) -> bool:
+    """Return True for a channel wider than 2.4 GHz can offer.
+
+    2.4 GHz tops out at 40 MHz, so an 80 or 160 MHz link cannot be on it no
+    matter how the radios are numbered.
+    """
+    match = re.search(r"(\d+)", str(bandwidth or ""))
+    return bool(match) and int(match.group(1)) > 40
+
+
+def band_label(
+    index: int | None,
+    sysreport: dict[str, Any] | None,
+    *,
+    bandwidth: Any = None,
+) -> str | None:
     """Return a human band label ("5 GHz") for a radio index.
 
-    The node reports its radios in order in ``bands`` (e.g. "2.4G|5G"), which
-    maps directly onto the radio index. Channel numbers are only used when that
-    field is missing.
+    The radio's own channel decides, because a channel number is a measured
+    fact. The order of the ``bands`` list is only a convention, and at least one
+    firmware lists the bands the other way round from the radio numbering, so it
+    is the last resort rather than the first.
     """
     if index is None:
         return None
 
-    bands = (sysreport or {}).get("bands")
-    if isinstance(bands, str) and bands:
-        parts = [part.strip() for part in bands.split("|") if part.strip()]
-        if index < len(parts):
-            label = _BAND_LABELS.get(parts[index].lower())
-            if label:
-                return label
+    label = _band_from_channel(_radio_channel(index, sysreport))
 
-    channel = _radio_channel(index, sysreport)
+    if label is None:
+        declared = _declared_bands(sysreport)
+        if index < len(declared):
+            label = declared[index]
+
+    if label == "2.4 GHz" and is_wide_channel(bandwidth):
+        # The radios are numbered or ordered differently than assumed. Only the
+        # node's own band list can say which one this actually is, and it only
+        # helps when that leaves a single candidate.
+        alternatives = {band for band in _declared_bands(sysreport) if band != "2.4 GHz"}
+        return alternatives.pop() if len(alternatives) == 1 else None
+
+    return label
+
+
+def _band_from_channel(channel: int | None) -> str | None:
+    """Return the band a Wi-Fi channel number belongs to."""
     if channel is None:
         return None
     return "2.4 GHz" if channel <= 14 else "5 GHz"
@@ -146,7 +184,10 @@ def backhaul_label(sysreport: dict[str, Any] | None) -> str | None:
     if is_wired_iface(iface):
         return WIRED_BACKHAUL_LABEL
 
-    band = band_label(radio_index(iface), sysreport)
+    # The width of the active link is itself evidence of the band, so the
+    # station is looked up before labelling.
+    station = select_backhaul_station(sysreport) or {}
+    band = band_label(radio_index(iface), sysreport, bandwidth=station.get("bw"))
     if band:
         return f"Wi-Fi {band}"
     return str(iface)
@@ -209,14 +250,21 @@ def backhaul_details(sysreport: dict[str, Any] | None) -> dict[str, Any]:
     if station is None:
         return details
 
-    # rssireal is the calibrated value; rssi is the same number offset by 100
-    # and rssi0/rssi1 are the per-chain readings.
+    # rssireal is the calibrated value and rssi0/rssi1 are the per-chain
+    # readings. Plain `rssi` is the same number offset by 100 on the firmware
+    # this was written against, so it is only trusted when it is negative:
+    # a negative RSSI is dBm by definition, while a positive one is the offset
+    # form and would be reported as an absurd signal.
     signal = _as_int(station.get("rssireal"))
     if signal is None:
         chains = [_as_int(station.get(key)) for key in ("rssi0", "rssi1", "rssi2", "rssi3")]
         chains = [chain for chain in chains if chain is not None]
         if chains:
             signal = max(chains)
+    if signal is None:
+        reported = _as_int(station.get("rssi"))
+        if reported is not None and reported < 0:
+            signal = reported
     if signal is not None:
         details["backhaul_signal"] = signal
 

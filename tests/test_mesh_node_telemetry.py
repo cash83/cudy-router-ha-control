@@ -373,3 +373,77 @@ def test_reported_identifiers_survive_an_empty_refresh() -> None:
     device_info = load_cudy_module("device_info")
 
     assert device_info.reported_device_identifiers("entry-1", None) == {"entry-1"}
+
+
+def _wr3600e_node(*, bands: str, radio1_channel=None) -> dict:
+    """A node shaped like the WR3600E on 2.5.30b from issue #1.
+
+    Its backhaul is the 160 MHz link on wlan11, which the router's own web
+    interface reports as "5G WiFi".
+    """
+    sysstatinfo = {"radio0": {"channel": "6"}}
+    if radio1_channel is not None:
+        sysstatinfo["radio1"] = {"channel": radio1_channel}
+    return {
+        "devcnt": 7,
+        "name": "EG",
+        "state": "connected",
+        "sysstatinfo": sysstatinfo,
+        "sysreport": {
+            "bands": bands,
+            "backhaul": "wlan11",
+            "meshtype": "auto",
+            "sta": [
+                {"iface": "wlan01", "bw": "ht20", "txrate": 144, "rxrate": 144},
+                {"iface": "wlan11", "bw": "ht160", "txrate": 598, "rxrate": 938, "mode": "11ax"},
+            ],
+        },
+    }
+
+
+def test_band_comes_from_the_radio_channel_not_the_bands_order() -> None:
+    """A channel is a measured fact; the order of `bands` is only a convention."""
+    # This firmware lists its bands the other way round from the radio numbering.
+    node = _wr3600e_node(bands="5G|2.4G", radio1_channel=100)
+
+    assert mesh.node_telemetry(node)["backhaul"] == "Wi-Fi 5 GHz"
+
+
+def test_a_wide_link_is_never_reported_as_2_4_ghz() -> None:
+    """2.4 GHz tops out at 40 MHz, so a 160 MHz link cannot be on it."""
+    # No channel to go by, and the bands order would wrongly say 2.4 GHz.
+    node = _wr3600e_node(bands="5G|2.4G")
+
+    assert mesh.node_telemetry(node)["backhaul"] == "Wi-Fi 5 GHz"
+
+
+def test_the_bands_order_still_serves_when_nothing_contradicts_it() -> None:
+    """It remains the best guess for a narrow link with no channel reported."""
+    node = _wr3600e_node(bands="2.4G|5G")
+    node["sysreport"]["backhaul"] = "wlan01"
+
+    assert mesh.node_telemetry(node)["backhaul"] == "Wi-Fi 2.4 GHz"
+
+
+def test_an_ambiguous_wide_link_is_left_unlabelled() -> None:
+    """With 5 and 6 GHz both on offer, guessing would just be a coin flip."""
+    node = _wr3600e_node(bands="5G|2.4G|6G")
+
+    # Falls back to the raw interface rather than inventing a band.
+    assert mesh.node_telemetry(node)["backhaul"] == "wlan11"
+
+
+def test_a_negative_plain_rssi_is_read_as_dbm() -> None:
+    """Some firmware reports only `rssi`; negative means it is already dBm."""
+    node = _wr3600e_node(bands="5G|2.4G", radio1_channel=100)
+    node["sysreport"]["sta"][1]["rssi"] = -60
+
+    assert mesh.node_telemetry(node)["backhaul_signal"] == -60
+
+
+def test_a_positive_plain_rssi_is_ignored() -> None:
+    """There it is the dBm value offset by 100, and would read as a huge signal."""
+    node = _wr3600e_node(bands="5G|2.4G", radio1_channel=100)
+    node["sysreport"]["sta"][1]["rssi"] = 42
+
+    assert "backhaul_signal" not in mesh.node_telemetry(node)
