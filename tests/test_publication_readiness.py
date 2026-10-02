@@ -33,11 +33,16 @@ def test_manifest_has_required_hacs_fields() -> None:
     assert manifest["dependencies"] == ["http"]
     assert manifest["issue_tracker"] == "https://github.com/cash83/cudy-router-ha-control/issues"
     assert manifest["integration_type"] == "hub"
+    # beautifulsoup4 is shipped by Home Assistant itself, pinned to 4.13.3. A
+    # custom integration lands in the same Python environment, so an exact pin
+    # on a different version forces an upgrade on every install and hassfest
+    # rejects it. The range accepts Home Assistant's version without demanding
+    # one of its own.
     assert manifest["requirements"] == [
-        "beautifulsoup4==4.14.3",
+        "beautifulsoup4>=4.13.3,<5",
         "python-dateutil==2.9.0.post0",
     ]
-    assert manifest["version"] == "1.4.2"
+    assert manifest["version"] == "1.4.3"
     assert "image" not in manifest
 
 
