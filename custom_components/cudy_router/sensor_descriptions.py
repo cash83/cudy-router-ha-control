@@ -753,11 +753,16 @@ DEVICE_CONNECTION_TYPE_SENSOR = CudyRouterSensorEntityDescription(
     entity_category=EntityCategory.DIAGNOSTIC,
 )
 
+# The router prints this column as text ("-52 dBm"). It is published as the
+# number it is, so it can be compared, drawn on a graph and read by anything
+# that expects a signal strength.
 DEVICE_SIGNAL_DETAILS_SENSOR = CudyRouterSensorEntityDescription(
-    key="signal",
+    key="signal_dbm",
     module="devices",
     name_suffix="Signal",
-    icon="mdi:wifi-strength-2",
+    device_class=SensorDeviceClass.SIGNAL_STRENGTH,
+    native_unit_of_measurement=SIGNAL_STRENGTH_DECIBELS_MILLIWATT,
+    state_class=SensorStateClass.MEASUREMENT,
     entity_category=EntityCategory.DIAGNOSTIC,
 )
 

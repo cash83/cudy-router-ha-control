@@ -34,7 +34,7 @@ Other Cudy models may work when their firmware exposes compatible LuCI pages, bu
 - Reboot buttons and services for router restart, 5G connection restart, band switching, SMS, and AT commands.
 - Mesh devices connected sensor on routers that report mesh topology.
 - Per mesh node: backhaul type, backhaul signal and TX/RX rates on wireless nodes, and the list of end devices attached to that node as attributes of its connected devices sensor.
-- Connected-client controls and optional device tracker entities.
+- Connected-client controls and optional device tracker entities, plus IP address, connection type, online time and the Wi-Fi signal as a dBm reading for each client you pick.
 - The SMS inbox sensor carries the newest received message, so an automation can notify you with its sender and text.
 - HACS custom repository support.
 

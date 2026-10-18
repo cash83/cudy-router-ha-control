@@ -211,6 +211,36 @@ async def async_setup_entry(
             if unique_id.endswith(("-mac", "-hostname", "-up_speed", "-down_speed")):
                 entity_registry.async_remove(entity_entry.entity_id)
 
+    def _migrate_client_signal_unique_ids() -> None:
+        """Move an existing per-client signal sensor onto its dBm unique ID.
+
+        Up to 1.4.3 that sensor published the column text ("-52 dBm") under a
+        unique ID ending in "-signal". It now publishes the reading in dBm,
+        under "-signal_dbm": renaming the registry entry keeps the entity ID,
+        the history and the dashboards of anyone who already had it, instead of
+        leaving a dead entity behind and adding a second one.
+        """
+        unique_id_prefix = f"{config_entry.entry_id}-device-"
+        for entity_entry in list(entity_registry.entities.values()):
+            unique_id = getattr(entity_entry, "unique_id", "") or ""
+            if (
+                getattr(entity_entry, "platform", None) != DOMAIN
+                or getattr(entity_entry, "domain", None) != "sensor"
+                or not unique_id.startswith(unique_id_prefix)
+                or not unique_id.endswith("-signal")
+            ):
+                continue
+
+            migrated_unique_id = f"{unique_id}_dbm"
+            if entity_registry.async_get_entity_id("sensor", DOMAIN, migrated_unique_id):
+                # The migrated entity already exists, so the text one is a leftover.
+                entity_registry.async_remove(entity_entry.entity_id)
+                continue
+            entity_registry.async_update_entity(
+                entity_entry.entity_id,
+                new_unique_id=migrated_unique_id,
+            )
+
     def _active_wan_interface_sensor_unique_ids() -> set[str]:
         """Return per-WAN sensor unique IDs that still have live coordinator values."""
         if module_available(device_model, MODULE_WAN_INTERFACES, coordinator.data) is False:
@@ -319,6 +349,7 @@ async def async_setup_entry(
             if load_balancing_data.get(sensor_key, {}).get("value") in (None, ""):
                 _remove_sensor_by_unique_id(f"{config_entry.entry_id}-{MODULE_LOAD_BALANCING}-{sensor_key}")
     _remove_legacy_manual_device_sensors()
+    _migrate_client_signal_unique_ids()
     _remove_stale_wan_interface_sensors()
     _remove_stale_wisp_sensors()
 
@@ -619,6 +650,18 @@ class CudyRouterConnectedDeviceSensor(
     def native_value(self) -> StateType:
         """Return the state of the sensor."""
         return self._current_device().get(self.entity_description.key)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return the state attributes."""
+        if self.entity_description.key != "signal_dbm":
+            return {}
+        # Firmware that does not report dBm leaves the sensor unknown; the text
+        # it does print stays readable here instead of being thrown away.
+        raw_signal = self._current_device().get("signal")
+        if raw_signal in (None, ""):
+            return {}
+        return {"signal_text": raw_signal}
 
     @property
     def available(self) -> bool:

@@ -75,6 +75,47 @@ def _parse_device_speed_pair(cell_text: str) -> tuple[float | None, float | None
     return upload, download
 
 
+# The connected-device table prints the signal as text, and only a reading that
+# already says dBm (or a bare negative number, which is dBm by definition) is
+# published as one. Some firmware puts a link-quality percentage in that column,
+# and a percentage published as dBm would read as a plausible signal instead of
+# a missing one.
+_CLIENT_SIGNAL_DBM_RE = re.compile(r"(?P<dbm>-\s*\d{1,3})\s*dbm", re.IGNORECASE)
+_BARE_NEGATIVE_RE = re.compile(r"-\s*\d{1,3}")
+# A Wi-Fi client runs from roughly -30 dBm down to -95; -100 is what an unmeasured
+# cell decodes to, which means "no reading" rather than an impossibly weak link.
+_WEAKEST_PLAUSIBLE_CLIENT_DBM = -100
+
+
+def parse_client_signal_dbm(raw_signal: Any) -> int | None:
+    """Return a connected client's signal in dBm, or None when there is none.
+
+    Wired clients, a dash, an empty cell and a column that holds something
+    other than dBm all return None, so a value is published only when the
+    router really measured one.
+    """
+    if raw_signal is None:
+        return None
+    if isinstance(raw_signal, bool):
+        return None
+    if isinstance(raw_signal, (int, float)):
+        dbm = int(raw_signal)
+    else:
+        text = str(raw_signal).strip()
+        if not text:
+            return None
+        match = _CLIENT_SIGNAL_DBM_RE.search(text)
+        if match is None:
+            match = _BARE_NEGATIVE_RE.fullmatch(text)
+            if match is None:
+                return None
+            dbm = int(match.group(0).replace(" ", ""))
+        else:
+            dbm = int(match.group("dbm").replace(" ", ""))
+
+    return dbm if _WEAKEST_PLAUSIBLE_CLIENT_DBM < dbm < 0 else None
+
+
 def _hidden_input_bool(columns: list[Any], name_suffix: str) -> bool | None:
     """Read a 0/1 hidden input value from any column in the row."""
     for column in columns:
@@ -129,6 +170,7 @@ def _device_row_from_modern_columns(columns: list[Any]) -> dict[str, Any] | None
         "down_speed": download_speed,
         "connection_type": connection_type,
         "signal": signal,
+        "signal_dbm": parse_client_signal_dbm(signal),
         "online_time": online_time,
         "internet": _hidden_input_bool(columns, "internet"),
         "dnsfilter": _hidden_input_bool(columns, "dnsfilter"),
@@ -275,6 +317,7 @@ def get_all_devices(input_html: str) -> dict[str, Any]:
                     "down_speed": parse_speed(down_speed),
                     "connection_type": connection_type,
                     "signal": signal,
+                    "signal_dbm": parse_client_signal_dbm(signal),
                     "online_time": online_time,
                     "internet": _hidden_input_bool(columns, "internet"),
                     "dnsfilter": _hidden_input_bool(columns, "dnsfilter"),
