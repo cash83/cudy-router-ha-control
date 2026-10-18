@@ -216,6 +216,25 @@ def tracker_option_label(name: str | None, normalized_mac: str) -> str:
     return formatted_mac
 
 
+def manual_picker_names(
+    stored_manual_macs: set[str] | frozenset[str],
+    known_clients: Mapping[str, Mapping[str, Any]] | None = None,
+) -> dict[str, str | None]:
+    """Return the clients the manual picker must offer besides the live ones.
+
+    A client that moves to another router, or is simply switched off, drops out
+    of the router's list. It keeps its place in the picker while it is selected
+    or still has entities, so a selection is not lost the moment the device
+    goes away and cannot be put back.
+    """
+    clients = known_clients or {}
+    return {
+        normalized_mac: clients.get(normalized_mac, {}).get("name")
+        for normalized_mac in (set(stored_manual_macs) | set(clients))
+        if len(normalized_mac) == 12
+    }
+
+
 def tracker_picker_options(
     connected_devices: list[dict[str, Any]],
     known_trackers: Mapping[str, str | None],

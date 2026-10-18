@@ -242,3 +242,31 @@ def test_leftover_text_sensor_is_removed_when_the_dbm_one_exists(monkeypatch) ->
 
     assert registry.removed == ["sensor.wlan0_signal"]
     assert registry.updated == []
+
+
+device_tracking = load_cudy_module("device_tracking")
+
+
+def test_picker_keeps_a_client_that_is_no_longer_connected() -> None:
+    """A selected or known client stays selectable while it is away."""
+    names = device_tracking.manual_picker_names(
+        {NORMALIZED_MAC},
+        {"aabbccddeeff": {"name": "Tablet"}},
+    )
+
+    assert names == {NORMALIZED_MAC: None, "aabbccddeeff": "Tablet"}
+
+    options = device_tracking.tracker_picker_options(
+        [{"mac": "11:22:33:44:55:66", "hostname": "Live client"}],
+        names,
+    )
+    values = {option["value"] for option in options}
+
+    # The live client, the one that is only selected, and the one that only
+    # has entities left: all three can be picked.
+    assert values == {"112233445566", NORMALIZED_MAC, "aabbccddeeff"}
+
+
+def test_picker_names_ignore_entries_that_are_not_macs() -> None:
+    """Junk in the stored selection must not become a picker option."""
+    assert device_tracking.manual_picker_names({"nonsense", ""}, {"short": {}}) == {}

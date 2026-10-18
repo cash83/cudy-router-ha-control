@@ -42,6 +42,7 @@ from .device_info import known_client_devices
 from .device_tracking import (
     configured_tracked_macs,
     eligible_manual_picker_devices,
+    manual_picker_names,
     eligible_tracker_picker_devices,
     manual_allowed_client_macs,
     next_options_flow_step,
@@ -301,6 +302,8 @@ class CudyRouterOptionsFlowHandler(OptionsFlow):
     @staticmethod
     def _multi_select_dropdown(
         options: list[selector.SelectOptionDict],
+        *,
+        allow_custom_value: bool = False,
     ) -> selector.SelectSelector:
         """Return a consistent multi-select dropdown selector."""
         return selector.SelectSelector(
@@ -308,6 +311,7 @@ class CudyRouterOptionsFlowHandler(OptionsFlow):
                 options=options,
                 multiple=True,
                 mode=selector.SelectSelectorMode.DROPDOWN,
+                custom_value=allow_custom_value,
             )
         )
 
@@ -412,10 +416,7 @@ class CudyRouterOptionsFlowHandler(OptionsFlow):
             device_list=pending_options.get(OPTIONS_DEVICELIST),
             known_clients=known_clients,
         )
-        manual_device_names = {
-            normalized_mac: known_clients.get(normalized_mac, {}).get("name")
-            for normalized_mac in stored_manual_macs
-        }
+        manual_device_names = manual_picker_names(stored_manual_macs, known_clients)
         manual_device_options = [
             selector.SelectOptionDict(label=option["label"], value=option["value"])
             for option in tracker_picker_options(
@@ -436,7 +437,11 @@ class CudyRouterOptionsFlowHandler(OptionsFlow):
         schema = vol.Schema(
             {
                 vol.Optional(OPTIONS_DEVICELIST): self._multi_select_dropdown(
-                    manual_device_options
+                    manual_device_options,
+                    # A client nobody has seen for a while is in no list at all:
+                    # its MAC can still be typed in, instead of being out of
+                    # reach until it comes back.
+                    allow_custom_value=True,
                 ),
             }
         )
