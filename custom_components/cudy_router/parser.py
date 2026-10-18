@@ -85,6 +85,15 @@ _BARE_NEGATIVE_RE = re.compile(r"-\s*\d{1,3}")
 # A Wi-Fi client runs from roughly -30 dBm down to -95; -100 is what an unmeasured
 # cell decodes to, which means "no reading" rather than an impossibly weak link.
 _WEAKEST_PLAUSIBLE_CLIENT_DBM = -100
+# Shift some firmware applies to a signal: a P4 on 2.4.20 prints "-157 dBm" for a
+# client its own pages measure live, because it takes the 100 dB offset off a
+# value that no longer carries it. Readings seen from such a router move by a dB
+# between polls, so they are measurements, not a placeholder.
+_DBM_OFFSET = 100
+# A rescued reading is a deduction, not what the router printed, so it has to
+# land somewhere a client can really sit: even a device touching the antenna
+# stays well below -10 dBm.
+_STRONGEST_PLAUSIBLE_CLIENT_DBM = -10
 
 
 def parse_client_signal_dbm(raw_signal: Any) -> int | None:
@@ -92,7 +101,8 @@ def parse_client_signal_dbm(raw_signal: Any) -> int | None:
 
     Wired clients, a dash, an empty cell and a column that holds something
     other than dBm all return None, so a value is published only when the
-    router really measured one.
+    router really measured one. A reading printed below the floor a Wi-Fi link
+    can reach is read back through the 100 dB offset the firmware took off it.
     """
     if raw_signal is None:
         return None
@@ -113,7 +123,21 @@ def parse_client_signal_dbm(raw_signal: Any) -> int | None:
         else:
             dbm = int(match.group("dbm").replace(" ", ""))
 
-    return dbm if _WEAKEST_PLAUSIBLE_CLIENT_DBM < dbm < 0 else None
+    if _WEAKEST_PLAUSIBLE_CLIENT_DBM < dbm < 0:
+        return dbm
+
+    # Below the floor the number cannot be a signal as printed. It is rescued
+    # only when putting the offset back lands inside the range a Wi-Fi link can
+    # occupy, so a column that turns out to mean something else is still
+    # refused instead of being published as a plausible reading.
+    rescued = dbm + _DBM_OFFSET
+    if (
+        dbm < _WEAKEST_PLAUSIBLE_CLIENT_DBM
+        and _WEAKEST_PLAUSIBLE_CLIENT_DBM < rescued <= _STRONGEST_PLAUSIBLE_CLIENT_DBM
+    ):
+        return rescued
+
+    return None
 
 
 def _hidden_input_bool(columns: list[Any], name_suffix: str) -> bool | None:

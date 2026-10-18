@@ -44,6 +44,23 @@ def test_columns_without_a_measurement_report_nothing() -> None:
     assert parser.parse_client_signal_dbm("-99 dBm") == -99
 
 
+def test_a_reading_printed_below_the_floor_is_read_back_through_the_offset() -> None:
+    """A P4 on 2.4.20 prints "-157 dBm" for a client it measures at -57."""
+    assert parser.parse_client_signal_dbm("-157 dBm") == -57
+    assert parser.parse_client_signal_dbm("-158 dBm") == -58
+    assert parser.parse_client_signal_dbm("-199 dBm") == -99
+    assert parser.parse_client_signal_dbm("-110 dBm") == -10
+
+
+def test_the_offset_is_not_put_back_where_the_result_makes_no_sense() -> None:
+    """The rescue is a deduction, so it only stands inside a real link's range."""
+    # -1 dBm is not a signal a client can report.
+    assert parser.parse_client_signal_dbm("-101 dBm") is None
+    # Still below the floor once the offset is back.
+    assert parser.parse_client_signal_dbm("-200 dBm") is None
+    assert parser.parse_client_signal_dbm("-250 dBm") is None
+
+
 def test_device_list_publishes_the_reading_next_to_the_raw_text() -> None:
     """Each parsed client should carry both the text and the dBm value."""
     devices = parser.parse_devices(MODERN_DEVICES_HTML, None)["device_list"]
