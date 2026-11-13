@@ -1,0 +1,37 @@
+{
+	"cudy-router-ha": {
+		"description": "Home Assistant Cudy Router integration",
+		"read": {
+			"ubus": {
+				"system": [ "board", "info" ],
+				"network.interface": [ "dump" ],
+				"network.device": [ "status" ],
+				"luci-rpc": [ "getDHCPLeases", "getHostHints", "getWirelessDevices" ],
+				"iwinfo": [ "assoclist", "freqlist", "txpowerlist", "info" ],
+				"luci": [ "getLEDs" ],
+				"usteer": [ "remote_info", "local_info" ],
+				"uci": [ "get" ],
+				"file": [ "read", "exec" ]
+			},
+			"uci": [ "dhcp", "firewall", "wireless" ],
+			"file": {
+				"/proc/stat": [ "read" ],
+				"/sbin/ip -4 neigh show": [ "exec" ]
+			}
+		},
+		"write": {
+			"ubus": {
+				"uci": [ "set", "add", "delete", "commit" ],
+				"network": [ "reload" ],
+				"network.wireless": [ "up", "down" ],
+				"rc": [ "init" ],
+				"file": [ "write", "exec" ]
+			},
+			"uci": [ "firewall", "wireless" ],
+			"file": {
+				"/sys/class/leds/*": [ "write" ],
+				"/sbin/reboot": [ "exec" ]
+			}
+		}
+	}
+}

@@ -58,6 +58,12 @@ from .device_tracking import (
     tracker_allowed_macs,
 )
 from .model_names import resolve_model_name
+from .openwrt import (
+    BACKEND_OPENWRT,
+    CONF_BACKEND,
+    OpenWrtRouter,
+    is_openwrt,
+)
 from .router import CudyRouter
 from .sms import async_send_sms_message, coordinator_supports_sms
 
@@ -196,7 +202,17 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 async def async_setup_entry(hass: HomeAssistant, entry: CudyRouterConfigEntry) -> bool:
     """Set up Cudy Router from a config entry."""
     data = entry.data
-    api = CudyRouter(
+
+    # A router that was flashed with OpenWrt keeps its config entry, and with
+    # it every entity; only the code that talks to it changes. An entry made
+    # before the flash carries no backend, so the router is asked once.
+    backend = data.get(CONF_BACKEND)
+    if backend is None:
+        if await hass.async_add_executor_job(is_openwrt, data[CONF_HOST]):
+            backend = BACKEND_OPENWRT
+
+    router_class = OpenWrtRouter if backend == BACKEND_OPENWRT else CudyRouter
+    api = router_class(
         hass,
         data[CONF_HOST],
         data[CONF_USERNAME],
@@ -214,6 +230,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: CudyRouterConfigEntry) -
 
     if not authenticated:
         raise ConfigEntryAuthFailed("Invalid authentication credentials")
+
+    if backend == BACKEND_OPENWRT and data.get(CONF_BACKEND) != BACKEND_OPENWRT:
+        hass.config_entries.async_update_entry(
+            entry, data={**data, CONF_BACKEND: BACKEND_OPENWRT}
+        )
 
     coordinator = CudyRouterDataUpdateCoordinator(hass, entry, api)
     await coordinator.async_config_entry_first_refresh()

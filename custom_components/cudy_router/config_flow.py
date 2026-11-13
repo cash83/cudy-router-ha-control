@@ -50,6 +50,7 @@ from .device_tracking import (
 )
 from .features import supports_sms_feature
 from .model_names import resolve_model_name
+from .openwrt import BACKEND_OPENWRT, CONF_BACKEND, OpenWrtRouter, is_openwrt
 from .router import CudyRouter
 
 _LOGGER = logging.getLogger(__name__)
@@ -77,6 +78,10 @@ async def validate_input(hass: HomeAssistant, data: dict[str, Any]) -> dict[str,
     Data has the keys from STEP_USER_DATA_SCHEMA with values provided by the user.
     """
     host = _normalize_host(data[CONF_HOST])
+
+    if await hass.async_add_executor_job(is_openwrt, host):
+        return await _validate_openwrt(hass, host, data)
+
     router = CudyRouter(hass, host, data[CONF_USERNAME], data[CONF_PASSWORD])
 
     try:
@@ -98,6 +103,37 @@ async def validate_input(hass: HomeAssistant, data: dict[str, Any]) -> dict[str,
 
     # Default title to "Cudy Router"
     return {"title": "Cudy Router", "host": router.base_url, "device_model": device_model}
+
+
+async def _validate_openwrt(
+    hass: HomeAssistant, host: str, data: dict[str, Any]
+) -> dict[str, str]:
+    """Validate the credentials of a router that runs OpenWrt."""
+    router = OpenWrtRouter(hass, host, data[CONF_USERNAME], data[CONF_PASSWORD])
+
+    try:
+        authenticated = await hass.async_add_executor_job(router.authenticate)
+    except Exception as err:
+        _LOGGER.exception("Error connecting to router: %s", err)
+        raise CannotConnect from err
+
+    if not authenticated:
+        raise InvalidAuth
+
+    # A router that was set up on stock firmware keeps the model it was given
+    # then, so that the device does not change name after the flash.
+    device_model = data.get(CONF_MODEL)
+    if not device_model or device_model == "default":
+        device_model = resolve_model_name(
+            await hass.async_add_executor_job(router.get_model)
+        )
+
+    return {
+        "title": "Cudy Router",
+        "host": router.base_url,
+        "device_model": device_model,
+        CONF_BACKEND: BACKEND_OPENWRT,
+    }
 
 
 def _connected_devices(hass: HomeAssistant, config_entry: ConfigEntry) -> list[dict[str, Any]]:
@@ -148,6 +184,8 @@ class CudyRouterConfigFlow(ConfigFlow, domain=DOMAIN):
                 await self.async_set_unique_id(info["host"])
                 self._abort_if_unique_id_configured()
                 user_input[CONF_MODEL] = info["device_model"]
+                if info.get(CONF_BACKEND):
+                    user_input[CONF_BACKEND] = info[CONF_BACKEND]
                 return self.async_create_entry(
                     title=info["title"],
                     data=user_input,
@@ -204,6 +242,10 @@ class CudyRouterConfigFlow(ConfigFlow, domain=DOMAIN):
             else:
                 updated_data[CONF_HOST] = info["host"]
                 updated_data[CONF_MODEL] = info["device_model"]
+                if info.get(CONF_BACKEND):
+                    updated_data[CONF_BACKEND] = info[CONF_BACKEND]
+                else:
+                    updated_data.pop(CONF_BACKEND, None)
                 self.hass.config_entries.async_update_entry(
                     self._reauth_entry,
                     data=updated_data,
